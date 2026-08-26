@@ -13,6 +13,8 @@
 #
 # Options:
 #   --story <id>            Story id embedded in the branch name (required)
+#   --branch <name>         Use this exact branch instead of searching by story
+#                           (useful when several branches contain the story id)
 #   --from-release <n>      Release the story branch was based on (required)
 #   --to-release <n>        Release to carry the story into (required)
 #   --remote <name>         Git remote (default: origin)
@@ -35,6 +37,7 @@
 set -euo pipefail
 
 STORY=""
+BRANCH_OVERRIDE=""
 FROM_RELEASE=""
 TO_RELEASE=""
 REMOTE="origin"
@@ -53,6 +56,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --story)          STORY="${2:-}"; shift 2 ;;
+    --branch)         BRANCH_OVERRIDE="${2:-}"; shift 2 ;;
     --from-release)   FROM_RELEASE="${2:-}"; shift 2 ;;
     --to-release)     TO_RELEASE="${2:-}"; shift 2 ;;
     --remote)         REMOTE="${2:-}"; shift 2 ;;
@@ -82,6 +86,12 @@ info "Fetching from $REMOTE..."
 git fetch --prune "$REMOTE"
 
 # --- Locate the story branch on the remote -----------------------------------
+if [[ -n "$BRANCH_OVERRIDE" ]]; then
+  BRANCH_OVERRIDE="${BRANCH_OVERRIDE#"${REMOTE}"/}"
+  git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${BRANCH_OVERRIDE}" >/dev/null \
+    || die "Branch '$BRANCH_OVERRIDE' does not exist on '$REMOTE'"
+  MATCHES=("${REMOTE}/${BRANCH_OVERRIDE}")
+else
 MATCHES=()
 while IFS= read -r line; do
   MATCHES+=("$line")
@@ -110,10 +120,24 @@ fi
 if [[ ${#MATCHES[@]} -eq 0 ]]; then
   die "No branch on '$REMOTE' matches story '$STORY'"
 elif [[ ${#MATCHES[@]} -gt 1 ]]; then
-  echo "Multiple branches match story '$STORY':" >&2
-  printf '  %s\n' "${MATCHES[@]}" >&2
-  die "Ambiguous story branch. Rename or delete the extras, or narrow the story id."
+  echo "Multiple branches match story '$STORY':"
+  for i in "${!MATCHES[@]}"; do
+    printf '  %2d) %s\n' "$((i + 1))" "${MATCHES[$i]}"
+  done
+  if [[ -t 0 ]]; then
+    CHOICE=""
+    while :; do
+      printf 'Pick the branch to cherry-pick from [1-%d]: ' "${#MATCHES[@]}"
+      read -r CHOICE
+      [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#MATCHES[@]} )) && break
+      echo "Invalid choice."
+    done
+    MATCHES=("${MATCHES[$((CHOICE - 1))]}")
+  else
+    die "Ambiguous story branch. Re-run with --branch <name> to choose one."
+  fi
 fi
+fi  # end of branch search (skipped when --branch is given)
 
 STORY_REF="${MATCHES[0]}"                      # e.g. origin/feature/US123456-fix-thing
 STORY_BRANCH="${STORY_REF#"${REMOTE}"/}"       # e.g. feature/US123456-fix-thing
