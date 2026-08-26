@@ -57,6 +57,7 @@ CREATE_PR=true
 DRY_RUN=false
 CONTINUE_RUN=false
 ABORT_RUN=false
+FORCE_PUSH=false
 
 SCRIPT_NAME=$(basename "$0")
 
@@ -101,6 +102,7 @@ RELEASE_PREFIX='$RELEASE_PREFIX'
 CREATE_PR=$CREATE_PR
 STORY_BRANCH='$STORY_BRANCH'
 NEW_BRANCH='$NEW_BRANCH'
+FORCE_PUSH=$FORCE_PUSH
 NEXT_INDEX=$1
 COMMITS_STR='${COMMITS[*]}'
 EOF
@@ -370,16 +372,27 @@ if ! $CONTINUE_RUN; then
   BASE_NAME=$(echo "$STORY_BRANCH" | sed -E "s/-${RELEASE_PREFIX}[0-9]+\$//")
   NEW_BRANCH="${BASE_NAME}-${TO_BRANCH}"
 
+  # A leftover branch from an earlier run is reset and reused, not an error.
+  REUSE_LOCAL=false
+  FORCE_PUSH=false
   if git rev-parse --verify --quiet "refs/heads/${NEW_BRANCH}" >/dev/null; then
-    die "Local branch '$NEW_BRANCH' already exists. Delete it or handle it manually."
+    REUSE_LOCAL=true
   fi
   if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${NEW_BRANCH}" >/dev/null; then
-    die "Branch '$NEW_BRANCH' already exists on '$REMOTE'."
+    FORCE_PUSH=true
   fi
 
   if $DRY_RUN; then
-    info "[dry-run] Would create '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}',"
-    info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
+    if $REUSE_LOCAL; then
+      info "[dry-run] Would reset existing branch '$NEW_BRANCH' to '${REMOTE}/${TO_BRANCH}',"
+    else
+      info "[dry-run] Would create '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}',"
+    fi
+    if $FORCE_PUSH; then
+      info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, force-push to '$REMOTE',"
+    else
+      info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
+    fi
     if $CREATE_PR; then
       info "[dry-run] and open a PR from '$NEW_BRANCH' into '$TO_BRANCH'."
     else
@@ -388,8 +401,18 @@ if ! $CONTINUE_RUN; then
     exit 0
   fi
 
-  info "Creating '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}'..."
-  git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
+  if $REUSE_LOCAL; then
+    info "Branch '$NEW_BRANCH' already exists; resetting it to '${REMOTE}/${TO_BRANCH}'..."
+    git switch -q "$NEW_BRANCH"
+    git reset --hard -q "${REMOTE}/${TO_BRANCH}"
+  else
+    if $FORCE_PUSH; then
+      info "Branch '$NEW_BRANCH' exists on '$REMOTE'; recreating it from '${REMOTE}/${TO_BRANCH}'..."
+    else
+      info "Creating '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}'..."
+    fi
+    git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
+  fi
 else
   # --- Resume: finish whatever was interrupted -------------------------------
   if [[ "$(git rev-parse --abbrev-ref HEAD)" != "$NEW_BRANCH" ]]; then
@@ -447,8 +470,14 @@ EOF
 done
 
 # --- Push --------------------------------------------------------------------
-info "Pushing '$NEW_BRANCH' to '$REMOTE'..."
-PUSH_OUTPUT=$(git push -u "$REMOTE" "$NEW_BRANCH" 2>&1) \
+PUSH_ARGS=(-u)
+if $FORCE_PUSH; then
+  PUSH_ARGS+=(--force-with-lease)
+  info "Force-pushing '$NEW_BRANCH' to '$REMOTE' (branch already existed there)..."
+else
+  info "Pushing '$NEW_BRANCH' to '$REMOTE'..."
+fi
+PUSH_OUTPUT=$(git push "${PUSH_ARGS[@]}" "$REMOTE" "$NEW_BRANCH" 2>&1) \
   || { echo "$PUSH_OUTPUT" >&2; die "Push failed. Fix the problem and re-run with --continue."; }
 
 # GitHub/Bitbucket/GitLab print a create-pull-request URL in the push response.
@@ -485,6 +514,16 @@ if $CREATE_PR; then
           PR_URL=$(printf '%s' "$RESPONSE" | python3 -c \
             'import sys, json; print(json.load(sys.stdin)["links"]["html"]["href"])' \
             2>/dev/null) || PR_URL=""
+        fi
+        if [[ -z "$PR_URL" ]]; then
+          # Creation fails if a PR is already open for this branch; report it.
+          ENC_BRANCH=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$NEW_BRANCH")
+          PR_URL=$(curl -sf "${BB_AUTH[@]}" \
+            "https://api.bitbucket.org/2.0/repositories/${WORKSPACE_REPO}/pullrequests?state=OPEN&q=source.branch.name+%3D+%22${ENC_BRANCH}%22" \
+            2>/dev/null \
+            | python3 -c 'import sys, json
+v = json.load(sys.stdin).get("values", [])
+print(v[0]["links"]["html"]["href"] if v else "")' 2>/dev/null) || PR_URL=""
         fi
         [[ -n "$PR_URL" ]] || echo "WARNING: Bitbucket PR creation failed; create the PR manually." >&2
       else
