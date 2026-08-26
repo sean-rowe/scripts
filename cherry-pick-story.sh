@@ -19,10 +19,10 @@
 #   cherry-pick-story.sh --story US123456 --from-release 42 --to-release 43
 #
 # If a cherry-pick hits a conflict, the script stops and saves its progress.
-# Resolve the conflict, 'git add' the resolved files, then run:
+# Edit the conflicted files to resolve them, then run:
 #   cherry-pick-story.sh --continue
-# It finishes the interrupted commit, applies the rest, pushes, and opens
-# the PR. To discard the run instead:
+# It stages your resolutions (no 'git add' needed), finishes the interrupted
+# commit, applies the rest, pushes, and opens the PR. To discard the run:
 #   cherry-pick-story.sh --abort
 #
 # Options:
@@ -422,8 +422,27 @@ else
   fi
 
   if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
-    [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
-      || die "Unresolved conflicts remain. Fix them, 'git add' the files, then re-run --continue."
+    # Stage the user's resolutions automatically, refusing only if a file
+    # still contains conflict markers (i.e. wasn't actually resolved).
+    UNMERGED=()
+    while IFS= read -r f; do
+      UNMERGED+=("$f")
+    done < <(git diff --name-only --diff-filter=U)
+    if [[ ${#UNMERGED[@]} -gt 0 ]]; then
+      STILL_CONFLICTED=()
+      for f in "${UNMERGED[@]}"; do
+        if [[ -f "$f" ]] && grep -qE '^(<{7}|>{7})( |$)' "$f"; then
+          STILL_CONFLICTED+=("$f")
+        fi
+      done
+      if [[ ${#STILL_CONFLICTED[@]} -gt 0 ]]; then
+        echo "These files still contain conflict markers (<<<<<<< / >>>>>>>):" >&2
+        printf '    %s\n' "${STILL_CONFLICTED[@]}" >&2
+        die "Finish resolving them, then re-run --continue."
+      fi
+      info "Staging resolved files: ${UNMERGED[*]}"
+      git add -A -- "${UNMERGED[@]}"
+    fi
     info "Finishing the interrupted cherry-pick..."
     if ! GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
       if [[ -z "$(git diff --cached --name-only)" ]]; then
@@ -454,10 +473,9 @@ while (( i < TOTAL )); do
 
 CONFLICT while cherry-picking $SUBJECT  (commit $((i + 1)) of $TOTAL)
 
-Progress has been saved. Resolve the conflict, then:
+Progress has been saved. Edit the conflicted files to resolve them, then:
 
-    git add <resolved files>
-    $SCRIPT_NAME --continue     # finishes this commit and does the rest
+    $SCRIPT_NAME --continue     # stages your fixes, finishes this commit, does the rest
 
 To give up instead:
 
