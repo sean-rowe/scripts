@@ -4,9 +4,8 @@
 #
 # Cherry-pick a user story's commits from one release into another.
 #
-# Finds the story branch, computes the commits it has on top of the
-# from-release branch, creates a new branch off the to-release branch,
-# cherry-picks those commits onto it, pushes the result, and opens a PR.
+# Finds the story's commits, creates a new branch off the to-release branch,
+# cherry-picks them onto it, pushes the result, and opens a PR.
 #
 # The story's commits are resolved in this order:
 #   1. --branch, if given: everything on that branch that isn't on from-release
@@ -19,6 +18,13 @@
 # Usage:
 #   cherry-pick-story.sh --story US123456 --from-release 42 --to-release 43
 #
+# If a cherry-pick hits a conflict, the script stops and saves its progress.
+# Resolve the conflict, 'git add' the resolved files, then run:
+#   cherry-pick-story.sh --continue
+# It finishes the interrupted commit, applies the rest, pushes, and opens
+# the PR. To discard the run instead:
+#   cherry-pick-story.sh --abort
+#
 # Options:
 #   --story <id>            Story id embedded in the branch name (required)
 #   --branch <name>         Use this exact branch instead of resolving it
@@ -28,6 +34,8 @@
 #   --release-prefix <p>    Release branch prefix (default: release-)
 #   --no-pr                 Skip automatic pull request creation
 #   --dry-run               Show what would happen without changing anything
+#   --continue              Resume an interrupted run after fixing conflicts
+#   --abort                 Abandon an interrupted run and delete its branch
 #
 # After a successful push the script opens a pull request into the to-release
 # branch automatically:
@@ -36,11 +44,6 @@
 #                        BITBUCKET_USER and BITBUCKET_APP_PASSWORD
 # The same credentials are used to resolve the story branch from its PR.
 # If neither is possible it prints the link to create the PR manually.
-#
-# On a cherry-pick conflict the script stops and leaves the conflict in place
-# so you can resolve it manually, then continue with:
-#   git cherry-pick --continue   (repeat until done)
-#   git push -u <remote> <new-branch>
 
 set -euo pipefail
 
@@ -52,6 +55,10 @@ REMOTE="origin"
 RELEASE_PREFIX="release-"
 CREATE_PR=true
 DRY_RUN=false
+CONTINUE_RUN=false
+ABORT_RUN=false
+
+SCRIPT_NAME=$(basename "$0")
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -71,24 +78,78 @@ while [[ $# -gt 0 ]]; do
     --release-prefix) RELEASE_PREFIX="${2:-}"; shift 2 ;;
     --no-pr)          CREATE_PR=false; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
+    --continue)       CONTINUE_RUN=true; shift ;;
+    --abort)          ABORT_RUN=true; shift ;;
     -h|--help)        usage 0 ;;
     *)                die "Unknown argument: $1 (use --help)" ;;
   esac
 done
 
-[[ -n "$STORY" ]]        || die "--story is required"
-[[ -n "$FROM_RELEASE" ]] || die "--from-release is required"
-[[ -n "$TO_RELEASE" ]]   || die "--to-release is required"
-[[ "$FROM_RELEASE" != "$TO_RELEASE" ]] || die "--from-release and --to-release are the same"
-
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "Not inside a git repository"
+STATE_FILE="$(git rev-parse --git-dir)/cherry-pick-story.state"
+
+# Progress is saved before each cherry-pick so --continue can resume. The
+# saved NEXT_INDEX points past the commit being attempted, because
+# 'git cherry-pick --continue' completes that one.
+save_state() {
+  cat > "$STATE_FILE" <<EOF
+STORY='$STORY'
+FROM_RELEASE='$FROM_RELEASE'
+TO_RELEASE='$TO_RELEASE'
+REMOTE='$REMOTE'
+RELEASE_PREFIX='$RELEASE_PREFIX'
+CREATE_PR=$CREATE_PR
+STORY_BRANCH='$STORY_BRANCH'
+NEW_BRANCH='$NEW_BRANCH'
+NEXT_INDEX=$1
+COMMITS_STR='${COMMITS[*]}'
+EOF
+}
+
+# --- --abort: discard an interrupted run -------------------------------------
+if $ABORT_RUN; then
+  [[ -f "$STATE_FILE" ]] || die "No interrupted $SCRIPT_NAME run to abort"
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+  git cherry-pick --abort >/dev/null 2>&1 || true
+  if [[ "$(git rev-parse --abbrev-ref HEAD)" == "$NEW_BRANCH" ]]; then
+    if git rev-parse --verify --quiet refs/heads/main >/dev/null; then
+      git switch -q main
+    elif git rev-parse --verify --quiet refs/heads/master >/dev/null; then
+      git switch -q master
+    else
+      git switch -q --detach "${REMOTE}/${RELEASE_PREFIX}${TO_RELEASE}"
+    fi
+  fi
+  git branch -D "$NEW_BRANCH" >/dev/null 2>&1 || true
+  rm -f "$STATE_FILE"
+  info "Aborted. Branch '$NEW_BRANCH' deleted; nothing was pushed."
+  exit 0
+fi
+
+# --- --continue: load saved progress -----------------------------------------
+START_INDEX=0
+if $CONTINUE_RUN; then
+  [[ -f "$STATE_FILE" ]] \
+    || die "No interrupted $SCRIPT_NAME run found (nothing to --continue)"
+  # shellcheck disable=SC1090
+  . "$STATE_FILE"
+  # shellcheck disable=SC2206
+  COMMITS=($COMMITS_STR)
+  START_INDEX=$NEXT_INDEX
+  info "Resuming: $STORY onto ${RELEASE_PREFIX}${TO_RELEASE} (commit $NEXT_INDEX of ${#COMMITS[@]} was in progress)"
+else
+  [[ -n "$STORY" ]]        || die "--story is required"
+  [[ -n "$FROM_RELEASE" ]] || die "--from-release is required"
+  [[ -n "$TO_RELEASE" ]]   || die "--to-release is required"
+  [[ "$FROM_RELEASE" != "$TO_RELEASE" ]] || die "--from-release and --to-release are the same"
+  if [[ -f "$STATE_FILE" ]] && ! $DRY_RUN; then
+    die "An interrupted run exists. Re-run with --continue to resume it, or --abort to discard it."
+  fi
+fi
 
 FROM_BRANCH="${RELEASE_PREFIX}${FROM_RELEASE}"
 TO_BRANCH="${RELEASE_PREFIX}${TO_RELEASE}"
-
-if [[ -n "$(git status --porcelain)" ]]; then
-  die "Working tree is not clean. Commit or stash your changes first."
-fi
 
 # --- Detect the git host -----------------------------------------------------
 REMOTE_URL=$(git remote get-url "$REMOTE")
@@ -155,205 +216,240 @@ for c in reversed(json.load(sys.stdin).get("values", [])):
   esac
 }
 
-info "Fetching from $REMOTE..."
-git fetch --prune "$REMOTE"
-
-# --- Verify release branches exist on the remote -----------------------------
-git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${FROM_BRANCH}" >/dev/null \
-  || die "Branch '$FROM_BRANCH' does not exist on '$REMOTE'"
-git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${TO_BRANCH}" >/dev/null \
-  || die "Branch '$TO_BRANCH' does not exist on '$REMOTE'"
-
-# --- Resolve the story branch and its commits --------------------------------
-# COMMITS is filled either from the story's PR (preferred: the PR records the
-# exact hashes) or from git history relative to the from-release branch.
-COMMITS=()
-STORY_BRANCH=""
-STORY_REF=""      # set only when resolving from a branch ref
-
-MATCHES=()
-if [[ -n "$BRANCH_OVERRIDE" ]]; then
-  BRANCH_OVERRIDE="${BRANCH_OVERRIDE#"${REMOTE}"/}"
-  git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${BRANCH_OVERRIDE}" >/dev/null \
-    || die "Branch '$BRANCH_OVERRIDE' does not exist on '$REMOTE'"
-  MATCHES=("${REMOTE}/${BRANCH_OVERRIDE}")
-fi
-
-if [[ ${#MATCHES[@]} -eq 0 ]]; then
-  PR_MATCH=$(find_story_pr)
-  if [[ -n "$PR_MATCH" ]]; then
-    PR_ID="${PR_MATCH%%$'\t'*}"
-    PR_BRANCH="${PR_MATCH#*$'\t'}"
-    info "Found PR #$PR_ID into $FROM_BRANCH (source branch: $PR_BRANCH)"
-    while IFS= read -r line; do
-      COMMITS+=("$line")
-    done < <(pr_commit_hashes "$PR_ID")
-
-    # Every hash must exist locally (it will, if it's reachable from any
-    # fetched branch — merged PRs are reachable from the from-release branch).
-    for h in "${COMMITS[@]:+${COMMITS[@]}}"; do
-      if ! git cat-file -e "${h}^{commit}" 2>/dev/null; then
-        echo "WARNING: PR commit $h not found locally; falling back to branch history." >&2
-        COMMITS=()
-        break
-      fi
-    done
-
-    if [[ ${#COMMITS[@]} -gt 0 ]]; then
-      STORY_BRANCH="$PR_BRANCH"
-    else
-      MATCHES=()
-      if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${PR_BRANCH}" >/dev/null; then
-        MATCHES=("${REMOTE}/${PR_BRANCH}")
-      else
-        echo "WARNING: could not read commits from PR #$PR_ID and branch '$PR_BRANCH'" >&2
-        echo "         no longer exists on '$REMOTE'; falling back to branch-name search." >&2
-      fi
-    fi
+if ! $CONTINUE_RUN; then
+  if [[ -n "$(git status --porcelain)" ]]; then
+    die "Working tree is not clean. Commit or stash your changes first."
   fi
-fi
 
-if [[ ${#COMMITS[@]} -eq 0 && ${#MATCHES[@]} -eq 0 ]]; then
-  while IFS= read -r line; do
-    MATCHES+=("$line")
-  done < <(git branch -r --list "${REMOTE}/*" --format='%(refname:short)' \
-           | grep -iF -- "$STORY" || true)
+  info "Fetching from $REMOTE..."
+  git fetch --prune "$REMOTE"
 
-  # Branches this script generated earlier end in "-<release-prefix><n>" and
-  # also contain the story number. When several branches match, prefer the one
-  # made for the from-release (chaining, e.g. 42->43 then 43->44); otherwise
-  # ignore generated branches and keep the original(s).
-  if [[ ${#MATCHES[@]} -gt 1 ]]; then
-    FILTERED=()
-    while IFS= read -r line; do
-      FILTERED+=("$line")
-    done < <(printf '%s\n' "${MATCHES[@]}" | grep -E -- "-${RELEASE_PREFIX}${FROM_RELEASE}\$" || true)
-    if [[ ${#FILTERED[@]} -eq 0 ]]; then
-      while IFS= read -r line; do
-        FILTERED+=("$line")
-      done < <(printf '%s\n' "${MATCHES[@]}" | grep -Ev -- "-${RELEASE_PREFIX}[0-9]+\$" || true)
-    fi
-    if [[ ${#FILTERED[@]} -gt 0 ]]; then
-      MATCHES=("${FILTERED[@]}")
-    fi
+  # --- Verify release branches exist on the remote ---------------------------
+  git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${FROM_BRANCH}" >/dev/null \
+    || die "Branch '$FROM_BRANCH' does not exist on '$REMOTE'"
+  git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${TO_BRANCH}" >/dev/null \
+    || die "Branch '$TO_BRANCH' does not exist on '$REMOTE'"
+
+  # --- Resolve the story branch and its commits ------------------------------
+  # COMMITS is filled either from the story's PR (preferred: the PR records
+  # the exact hashes) or from git history relative to the from-release branch.
+  COMMITS=()
+  STORY_BRANCH=""
+  STORY_REF=""      # set only when resolving from a branch ref
+
+  MATCHES=()
+  if [[ -n "$BRANCH_OVERRIDE" ]]; then
+    BRANCH_OVERRIDE="${BRANCH_OVERRIDE#"${REMOTE}"/}"
+    git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${BRANCH_OVERRIDE}" >/dev/null \
+      || die "Branch '$BRANCH_OVERRIDE' does not exist on '$REMOTE'"
+    MATCHES=("${REMOTE}/${BRANCH_OVERRIDE}")
   fi
 
   if [[ ${#MATCHES[@]} -eq 0 ]]; then
-    die "No branch on '$REMOTE' matches story '$STORY'"
-  elif [[ ${#MATCHES[@]} -gt 1 ]]; then
-    echo "Multiple branches match story '$STORY':"
-    for i in "${!MATCHES[@]}"; do
-      printf '  %2d) %s\n' "$((i + 1))" "${MATCHES[$i]}"
-    done
-    if [[ -t 0 ]]; then
-      CHOICE=""
-      while :; do
-        printf 'Pick the branch to cherry-pick from [1-%d]: ' "${#MATCHES[@]}"
-        read -r CHOICE
-        [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#MATCHES[@]} )) && break
-        echo "Invalid choice."
+    PR_MATCH=$(find_story_pr)
+    if [[ -n "$PR_MATCH" ]]; then
+      PR_ID="${PR_MATCH%%$'\t'*}"
+      PR_BRANCH="${PR_MATCH#*$'\t'}"
+      info "Found PR #$PR_ID into $FROM_BRANCH (source branch: $PR_BRANCH)"
+      while IFS= read -r line; do
+        COMMITS+=("$line")
+      done < <(pr_commit_hashes "$PR_ID")
+
+      # Every hash must exist locally (it will, if it's reachable from any
+      # fetched branch — merged PRs are reachable from the from-release branch).
+      for h in "${COMMITS[@]:+${COMMITS[@]}}"; do
+        if ! git cat-file -e "${h}^{commit}" 2>/dev/null; then
+          echo "WARNING: PR commit $h not found locally; falling back to branch history." >&2
+          COMMITS=()
+          break
+        fi
       done
-      MATCHES=("${MATCHES[$((CHOICE - 1))]}")
-    else
-      die "Ambiguous story branch. Re-run with --branch <name> to choose one."
+
+      if [[ ${#COMMITS[@]} -gt 0 ]]; then
+        STORY_BRANCH="$PR_BRANCH"
+      else
+        MATCHES=()
+        if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${PR_BRANCH}" >/dev/null; then
+          MATCHES=("${REMOTE}/${PR_BRANCH}")
+        else
+          echo "WARNING: could not read commits from PR #$PR_ID and branch '$PR_BRANCH'" >&2
+          echo "         no longer exists on '$REMOTE'; falling back to branch-name search." >&2
+        fi
+      fi
     fi
   fi
-fi
 
-# --- Work out which commits to cherry-pick -----------------------------------
-if [[ ${#COMMITS[@]} -eq 0 ]]; then
-  # Branch-based: everything the story branch has on top of the from-release.
-  STORY_REF="${MATCHES[0]}"                    # e.g. origin/feature/US123456-fix-thing
-  STORY_BRANCH="${STORY_REF#"${REMOTE}"/}"     # e.g. feature/US123456-fix-thing
-  info "Found story branch: $STORY_BRANCH"
+  if [[ ${#COMMITS[@]} -eq 0 && ${#MATCHES[@]} -eq 0 ]]; then
+    while IFS= read -r line; do
+      MATCHES+=("$line")
+    done < <(git branch -r --list "${REMOTE}/*" --format='%(refname:short)' \
+             | grep -iF -- "$STORY" || true)
 
-  while IFS= read -r line; do
-    COMMITS+=("$line")
-  done < <(git rev-list --reverse --no-merges "${REMOTE}/${FROM_BRANCH}..${STORY_REF}")
+    # Branches this script generated earlier end in "-<release-prefix><n>" and
+    # also contain the story number. When several branches match, prefer the
+    # one made for the from-release (chaining, e.g. 42->43 then 43->44);
+    # otherwise ignore generated branches and keep the original(s).
+    if [[ ${#MATCHES[@]} -gt 1 ]]; then
+      FILTERED=()
+      while IFS= read -r line; do
+        FILTERED+=("$line")
+      done < <(printf '%s\n' "${MATCHES[@]}" | grep -E -- "-${RELEASE_PREFIX}${FROM_RELEASE}\$" || true)
+      if [[ ${#FILTERED[@]} -eq 0 ]]; then
+        while IFS= read -r line; do
+          FILTERED+=("$line")
+        done < <(printf '%s\n' "${MATCHES[@]}" | grep -Ev -- "-${RELEASE_PREFIX}[0-9]+\$" || true)
+      fi
+      if [[ ${#FILTERED[@]} -gt 0 ]]; then
+        MATCHES=("${FILTERED[@]}")
+      fi
+    fi
 
-  MERGE_COUNT=$(git rev-list --merges --count "${REMOTE}/${FROM_BRANCH}..${STORY_REF}")
-  if [[ "$MERGE_COUNT" -gt 0 ]]; then
-    echo "WARNING: $MERGE_COUNT merge commit(s) on $STORY_BRANCH will be skipped" >&2
-    echo "         (only non-merge commits are cherry-picked)." >&2
+    if [[ ${#MATCHES[@]} -eq 0 ]]; then
+      die "No branch on '$REMOTE' matches story '$STORY'"
+    elif [[ ${#MATCHES[@]} -gt 1 ]]; then
+      echo "Multiple branches match story '$STORY':"
+      for i in "${!MATCHES[@]}"; do
+        printf '  %2d) %s\n' "$((i + 1))" "${MATCHES[$i]}"
+      done
+      if [[ -t 0 ]]; then
+        CHOICE=""
+        while :; do
+          printf 'Pick the branch to cherry-pick from [1-%d]: ' "${#MATCHES[@]}"
+          read -r CHOICE
+          [[ "$CHOICE" =~ ^[0-9]+$ ]] && (( CHOICE >= 1 && CHOICE <= ${#MATCHES[@]} )) && break
+          echo "Invalid choice."
+        done
+        MATCHES=("${MATCHES[$((CHOICE - 1))]}")
+      else
+        die "Ambiguous story branch. Re-run with --branch <name> to choose one."
+      fi
+    fi
   fi
 
-  [[ ${#COMMITS[@]} -gt 0 ]] \
-    || die "No commits found on '$STORY_BRANCH' that aren't already on '$FROM_BRANCH'"
-else
-  # PR-based: the PR listed the hashes; drop merge commits (not cherry-pickable).
-  NONMERGE=()
-  for h in "${COMMITS[@]}"; do
-    if [[ -z "$(git rev-list --merges --no-walk "$h")" ]]; then
-      NONMERGE+=("$h")
-    else
-      echo "WARNING: skipping merge commit $h from the PR." >&2
+  # --- Work out which commits to cherry-pick ---------------------------------
+  if [[ ${#COMMITS[@]} -eq 0 ]]; then
+    # Branch-based: everything the story branch has on top of the from-release.
+    STORY_REF="${MATCHES[0]}"                  # e.g. origin/feature/US123456-fix-thing
+    STORY_BRANCH="${STORY_REF#"${REMOTE}"/}"   # e.g. feature/US123456-fix-thing
+    info "Found story branch: $STORY_BRANCH"
+
+    while IFS= read -r line; do
+      COMMITS+=("$line")
+    done < <(git rev-list --reverse --no-merges "${REMOTE}/${FROM_BRANCH}..${STORY_REF}")
+
+    MERGE_COUNT=$(git rev-list --merges --count "${REMOTE}/${FROM_BRANCH}..${STORY_REF}")
+    if [[ "$MERGE_COUNT" -gt 0 ]]; then
+      echo "WARNING: $MERGE_COUNT merge commit(s) on $STORY_BRANCH will be skipped" >&2
+      echo "         (only non-merge commits are cherry-picked)." >&2
     fi
-  done
-  COMMITS=("${NONMERGE[@]:+${NONMERGE[@]}}")
-  [[ ${#COMMITS[@]} -gt 0 ]] || die "PR #$PR_ID contains no cherry-pickable commits"
-fi
 
-info "Commits to cherry-pick (${#COMMITS[@]}):"
-for h in "${COMMITS[@]}"; do
-  git show -s --format='    %h %s' "$h"
-done
-
-# --- Create the new branch off the to-release branch -------------------------
-# e.g. feature/US123456-fix-thing -> feature/US123456-fix-thing-release-43
-# (a "-release-42" suffix from a previous run is replaced, not stacked)
-BASE_NAME=$(echo "$STORY_BRANCH" | sed -E "s/-${RELEASE_PREFIX}[0-9]+\$//")
-NEW_BRANCH="${BASE_NAME}-${TO_BRANCH}"
-
-if git rev-parse --verify --quiet "refs/heads/${NEW_BRANCH}" >/dev/null; then
-  die "Local branch '$NEW_BRANCH' already exists. Delete it or handle it manually."
-fi
-if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${NEW_BRANCH}" >/dev/null; then
-  die "Branch '$NEW_BRANCH' already exists on '$REMOTE'."
-fi
-
-if $DRY_RUN; then
-  info "[dry-run] Would create '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}',"
-  info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
-  if $CREATE_PR; then
-    info "[dry-run] and open a PR from '$NEW_BRANCH' into '$TO_BRANCH'."
+    [[ ${#COMMITS[@]} -gt 0 ]] \
+      || die "No commits found on '$STORY_BRANCH' that aren't already on '$FROM_BRANCH'"
   else
-    info "[dry-run] and skip PR creation (--no-pr)."
+    # PR-based: the PR listed the hashes; drop merge commits (not cherry-pickable).
+    NONMERGE=()
+    for h in "${COMMITS[@]}"; do
+      if [[ -z "$(git rev-list --merges --no-walk "$h")" ]]; then
+        NONMERGE+=("$h")
+      else
+        echo "WARNING: skipping merge commit $h from the PR." >&2
+      fi
+    done
+    COMMITS=("${NONMERGE[@]:+${NONMERGE[@]}}")
+    [[ ${#COMMITS[@]} -gt 0 ]] || die "PR #$PR_ID contains no cherry-pickable commits"
   fi
-  exit 0
-fi
 
-info "Creating '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}'..."
-git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
+  info "Commits to cherry-pick (${#COMMITS[@]}):"
+  for h in "${COMMITS[@]}"; do
+    git show -s --format='    %h %s' "$h"
+  done
+
+  # --- Create the new branch off the to-release branch -----------------------
+  # e.g. feature/US123456-fix-thing -> feature/US123456-fix-thing-release-43
+  # (a "-release-42" suffix from a previous run is replaced, not stacked)
+  BASE_NAME=$(echo "$STORY_BRANCH" | sed -E "s/-${RELEASE_PREFIX}[0-9]+\$//")
+  NEW_BRANCH="${BASE_NAME}-${TO_BRANCH}"
+
+  if git rev-parse --verify --quiet "refs/heads/${NEW_BRANCH}" >/dev/null; then
+    die "Local branch '$NEW_BRANCH' already exists. Delete it or handle it manually."
+  fi
+  if git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${NEW_BRANCH}" >/dev/null; then
+    die "Branch '$NEW_BRANCH' already exists on '$REMOTE'."
+  fi
+
+  if $DRY_RUN; then
+    info "[dry-run] Would create '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}',"
+    info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
+    if $CREATE_PR; then
+      info "[dry-run] and open a PR from '$NEW_BRANCH' into '$TO_BRANCH'."
+    else
+      info "[dry-run] and skip PR creation (--no-pr)."
+    fi
+    exit 0
+  fi
+
+  info "Creating '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}'..."
+  git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
+else
+  # --- Resume: finish whatever was interrupted -------------------------------
+  if [[ "$(git rev-parse --abbrev-ref HEAD)" != "$NEW_BRANCH" ]]; then
+    git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+      && die "A cherry-pick is in progress on a different branch; resolve or abort it first."
+    git switch "$NEW_BRANCH"
+  fi
+
+  if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+    [[ -z "$(git diff --name-only --diff-filter=U)" ]] \
+      || die "Unresolved conflicts remain. Fix them, 'git add' the files, then re-run --continue."
+    info "Finishing the interrupted cherry-pick..."
+    if ! GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
+      if [[ -z "$(git diff --cached --name-only)" ]]; then
+        info "Resolution left nothing to apply; skipping that commit."
+        git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1 || true
+      else
+        die "'git cherry-pick --continue' failed. Resolve the problem and re-run --continue."
+      fi
+    fi
+  fi
+fi
 
 # --- Cherry-pick -------------------------------------------------------------
-for COMMIT in "${COMMITS[@]}"; do
-  SUBJECT=$(git log -1 --format='%h %s' "$COMMIT")
-  info "Cherry-picking: $SUBJECT"
-  if ! git cherry-pick -x "$COMMIT" >/dev/null; then
-    cat >&2 <<EOF
+TOTAL=${#COMMITS[@]}
+i=$START_INDEX
+while (( i < TOTAL )); do
+  COMMIT="${COMMITS[$i]}"
+  save_state "$((i + 1))"
+  SUBJECT=$(git show -s --format='%h %s' "$COMMIT")
+  info "Cherry-picking ($((i + 1))/$TOTAL): $SUBJECT"
+  if ! PICK_OUT=$(git cherry-pick -x "$COMMIT" 2>&1); then
+    if [[ -z "$(git diff --name-only --diff-filter=U)" && -z "$(git diff --cached --name-only)" ]]; then
+      info "Nothing to apply (already on $TO_BRANCH); skipping."
+      git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1 || true
+    else
+      echo "$PICK_OUT" >&2
+      cat >&2 <<EOF
 
-CONFLICT while cherry-picking $SUBJECT
+CONFLICT while cherry-picking $SUBJECT  (commit $((i + 1)) of $TOTAL)
 
-You are on branch '$NEW_BRANCH'. Resolve the conflict, then:
+Progress has been saved. Resolve the conflict, then:
 
     git add <resolved files>
-    git cherry-pick --continue      # repeat for any further conflicts
-    git push -u $REMOTE $NEW_BRANCH
+    $SCRIPT_NAME --continue     # finishes this commit and does the rest
 
 To give up instead:
 
-    git cherry-pick --abort
-    git switch -
-    git branch -D $NEW_BRANCH
+    $SCRIPT_NAME --abort
 EOF
-    exit 1
+      exit 1
+    fi
   fi
+  i=$((i + 1))
 done
 
 # --- Push --------------------------------------------------------------------
 info "Pushing '$NEW_BRANCH' to '$REMOTE'..."
 PUSH_OUTPUT=$(git push -u "$REMOTE" "$NEW_BRANCH" 2>&1) \
-  || { echo "$PUSH_OUTPUT" >&2; die "Push failed"; }
+  || { echo "$PUSH_OUTPUT" >&2; die "Push failed. Fix the problem and re-run with --continue."; }
 
 # GitHub/Bitbucket/GitLab print a create-pull-request URL in the push response.
 PR_CREATE_HINT=$(echo "$PUSH_OUTPUT" | grep -Eo 'https?://[^[:space:]]+' | grep -Ei 'pull|merge|compare' | head -1 || true)
@@ -362,7 +458,7 @@ PR_CREATE_HINT=$(echo "$PUSH_OUTPUT" | grep -Eo 'https?://[^[:space:]]+' | grep 
 PR_URL=""
 if $CREATE_PR; then
   PR_TITLE="$STORY: cherry-pick $FROM_BRANCH -> $TO_BRANCH"
-  PR_BODY="Automated cherry-pick of ${#COMMITS[@]} commit(s) from '$STORY_BRANCH' (based on $FROM_BRANCH) onto '$TO_BRANCH'."
+  PR_BODY="Automated cherry-pick of $TOTAL commit(s) from '$STORY_BRANCH' (based on $FROM_BRANCH) onto '$TO_BRANCH'."
 
   case "$HOST" in
     github)
@@ -402,12 +498,14 @@ if $CREATE_PR; then
   esac
 fi
 
+rm -f "$STATE_FILE"
+
 echo
 echo "=============================================================="
 echo " SUCCESS"
 echo "=============================================================="
 echo " Story branch:  $STORY_BRANCH"
-echo " Cherry-picked: ${#COMMITS[@]} commit(s)  ($FROM_BRANCH -> $TO_BRANCH)"
+echo " Cherry-picked: $TOTAL commit(s)  ($FROM_BRANCH -> $TO_BRANCH)"
 echo " New branch:    $NEW_BRANCH  (pushed to $REMOTE)"
 if [[ -n "$PR_URL" ]]; then
   echo " Pull request:  $PR_URL"
