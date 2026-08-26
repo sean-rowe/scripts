@@ -75,7 +75,8 @@ git fetch --prune "$REMOTE"
 MATCHES=()
 while IFS= read -r line; do
   MATCHES+=("$line")
-done < <(git branch -r --list "${REMOTE}/*${STORY}*" --format='%(refname:short)')
+done < <(git branch -r --list "${REMOTE}/*" --format='%(refname:short)' \
+         | grep -iF -- "$STORY" || true)
 
 if [[ ${#MATCHES[@]} -eq 0 ]]; then
   die "No branch on '$REMOTE' matches story '$STORY'"
