@@ -136,7 +136,7 @@ git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
 for COMMIT in "${COMMITS[@]}"; do
   SUBJECT=$(git log -1 --format='%h %s' "$COMMIT")
   info "Cherry-picking: $SUBJECT"
-  if ! git cherry-pick -x "$COMMIT"; then
+  if ! git cherry-pick -x "$COMMIT" >/dev/null; then
     cat >&2 <<EOF
 
 CONFLICT while cherry-picking $SUBJECT
@@ -159,6 +159,22 @@ done
 
 # --- Push --------------------------------------------------------------------
 info "Pushing '$NEW_BRANCH' to '$REMOTE'..."
-git push -u "$REMOTE" "$NEW_BRANCH"
+PUSH_OUTPUT=$(git push -u "$REMOTE" "$NEW_BRANCH" 2>&1) \
+  || { echo "$PUSH_OUTPUT" >&2; die "Push failed"; }
 
-info "Done. '$STORY_BRANCH' has been carried from $FROM_BRANCH into $TO_BRANCH as '$NEW_BRANCH'."
+# GitHub/Bitbucket/GitLab print a create-pull-request URL in the push response.
+PR_URL=$(echo "$PUSH_OUTPUT" | grep -Eo 'https?://[^[:space:]]+' | grep -Ei 'pull|merge|compare' | head -1 || true)
+
+echo
+echo "=============================================================="
+echo " SUCCESS"
+echo "=============================================================="
+echo " Story branch:  $STORY_BRANCH"
+echo " Cherry-picked: ${#COMMITS[@]} commit(s)  ($FROM_BRANCH -> $TO_BRANCH)"
+echo " New branch:    $NEW_BRANCH  (pushed to $REMOTE)"
+if [[ -n "$PR_URL" ]]; then
+  echo " Create a PR:   $PR_URL"
+else
+  echo " Create a PR from '$NEW_BRANCH' into '$TO_BRANCH' on your git host."
+fi
+echo "=============================================================="
