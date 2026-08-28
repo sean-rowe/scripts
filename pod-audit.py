@@ -1145,37 +1145,30 @@ CHROME_CANDIDATES = [
 ]
 
 
-def find_chrome():
+def find_chromes():
+    """All usable browser binaries, POD_AUDIT_CHROME first, deduped."""
     override = os.environ.get("POD_AUDIT_CHROME")
-    candidates = ([override] if override else []) + CHROME_CANDIDATES
-    for c in candidates:
+    found = []
+    for c in ([override] if override else []) + CHROME_CANDIDATES:
         p = Path(c).expanduser()
-        if p.is_file():
-            return str(p)
-        found = shutil.which(c)
-        if found:
-            return found
-    return None
+        resolved = str(p) if p.is_file() else shutil.which(c)
+        if resolved and resolved not in found:
+            found.append(resolved)
+    return found
 
 
-def html_to_pdf(html_path, pdf_path):
-    chrome = find_chrome()
-    if not chrome:
-        warn("No Chromium-based browser found for PDF output; skipping.")
-        warn("Install Chrome/Edge/Brave or set POD_AUDIT_CHROME=/path/to/browser.")
-        return False
-    # Waiting for the browser process to exit is unreliable: headless Chrome
-    # with a fresh profile writes the PDF within seconds but can then linger
-    # forever, and launching against the user's default profile can block on
-    # sign-in/policy dialogs or a profile lock (corporate Edge). So: run with
-    # a throwaway profile, watch for the PDF file to appear and stop growing,
-    # then reap the browser ourselves.
-    info(f"Rendering PDF with {Path(chrome).name}...")
+def _print_pdf_attempt(chrome, html_path, pdf_path, timeout_s=60):
+    """Try one browser. Returns '' on success, else a failure description.
+    Waiting for the browser process to exit is unreliable: headless Chrome
+    with a fresh profile writes the PDF within seconds but can then linger
+    forever, and launching against the user's default profile can block on
+    sign-in/policy dialogs or a profile lock (corporate Edge). So: run with
+    a throwaway profile, watch for the PDF file to appear and stop growing,
+    then reap the browser ourselves."""
     try:
         pdf_path.unlink(missing_ok=True)
     except OSError as e:
-        warn(f"Cannot replace {pdf_path}: {e}")
-        return False
+        return f"cannot replace {pdf_path}: {e}"
     detail = ""
     with tempfile.TemporaryDirectory(prefix="pod-audit-pdf-") as tmp:
         log = Path(tmp, "browser.log")
@@ -1202,10 +1195,10 @@ def html_to_pdf(html_path, pdf_path):
                     elif exited or now - stable_at >= 2:
                         break  # written and settled
                 elif exited:
-                    detail = "browser exited without producing a PDF"
+                    detail = f"exited (code {proc.returncode}) without producing a PDF"
                     break
-                if now - start > 120:
-                    detail = "timed out after 120s"
+                if now - start > timeout_s:
+                    detail = f"timed out after {timeout_s}s"
                     break
                 time.sleep(0.3)
         except OSError as e:
@@ -1222,16 +1215,42 @@ def html_to_pdf(html_path, pdf_path):
                     except subprocess.TimeoutExpired:
                         pass
         if not detail and pdf_path.is_file() and pdf_path.stat().st_size > 0:
-            return True
+            return ""
+        # Failed: keep the browser's own output next to the report so the
+        # reason survives even if the terminal warning scrolls away.
+        tail = ""
+        kept = pdf_path.with_name(pdf_path.name + ".browser.log")
+        try:
+            text = log.read_text(errors="replace").strip()
+            tail = text.splitlines()[-1][:200] if text else ""
+            kept.write_text(text + "\n")
+        except OSError:
+            kept = None
+        parts = [detail or "no PDF produced"]
+        if tail:
+            parts.append(f"browser said: {tail}")
+        if kept:
+            parts.append(f"full log: {kept}")
+        return " — ".join(parts)
+
+
+def html_to_pdf(html_path, pdf_path):
+    browsers = find_chromes()
+    if not browsers:
+        warn("No Chromium-based browser found for PDF output; skipping.")
+        warn("Install Chrome/Edge/Brave or set POD_AUDIT_CHROME=/path/to/browser.")
+        return False
+    for chrome in browsers:
+        info(f"Rendering PDF with {Path(chrome).name}...")
+        detail = _print_pdf_attempt(chrome, html_path, pdf_path)
         if not detail:
-            try:
-                lines = log.read_text(errors="replace").strip().splitlines()
-                detail = lines[-1] if lines else "no output from the browser"
-            except OSError:
-                detail = "no output from the browser"
-    warn(f"PDF generation failed: {detail}")
-    warn("The HTML report is unaffected. If this browser keeps failing, set")
-    warn("POD_AUDIT_CHROME=/path/to/another/browser or [report].pdf = false.")
+            return True
+        warn(f"{Path(chrome).name}: {detail}")
+    warn("Every browser failed to produce the PDF. The HTML report is unaffected.")
+    warn("To debug by hand, run:")
+    warn(f'  "{browsers[0]}" --headless --print-to-pdf=/tmp/test.pdf \\')
+    warn(f"      {html_path.resolve().as_uri()}")
+    warn("then set POD_AUDIT_CHROME to a browser that works, or [report].pdf = false.")
     return False
 
 
