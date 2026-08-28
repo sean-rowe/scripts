@@ -59,6 +59,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -1147,15 +1149,74 @@ def html_to_pdf(html_path, pdf_path):
         warn("No Chromium-based browser found for PDF output; skipping.")
         warn("Install Chrome/Edge/Brave or set POD_AUDIT_CHROME=/path/to/browser.")
         return False
-    rc, _, err = run(
-        [chrome, "--headless", "--disable-gpu", "--no-pdf-header-footer",
-         f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
-        timeout=120,
-    )
-    if rc != 0 or not pdf_path.is_file():
-        warn(f"PDF generation failed: {err.splitlines()[-1] if err else f'exit {rc}'}")
+    # Waiting for the browser process to exit is unreliable: headless Chrome
+    # with a fresh profile writes the PDF within seconds but can then linger
+    # forever, and launching against the user's default profile can block on
+    # sign-in/policy dialogs or a profile lock (corporate Edge). So: run with
+    # a throwaway profile, watch for the PDF file to appear and stop growing,
+    # then reap the browser ourselves.
+    try:
+        pdf_path.unlink(missing_ok=True)
+    except OSError as e:
+        warn(f"Cannot replace {pdf_path}: {e}")
         return False
-    return True
+    detail = ""
+    with tempfile.TemporaryDirectory(prefix="pod-audit-pdf-") as tmp:
+        log = Path(tmp, "browser.log")
+        proc = None
+        try:
+            with open(log, "wb") as lf:
+                proc = subprocess.Popen(
+                    [chrome, "--headless", "--disable-gpu",
+                     f"--user-data-dir={tmp}/profile", "--no-first-run",
+                     "--no-default-browser-check", "--disable-extensions",
+                     "--disable-sync", "--no-pdf-header-footer",
+                     f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
+                    stdin=subprocess.DEVNULL, stdout=lf, stderr=lf,
+                )
+            start = time.monotonic()
+            last_size, stable_at = 0, 0.0
+            while True:
+                exited = proc.poll() is not None
+                now = time.monotonic()
+                size = pdf_path.stat().st_size if pdf_path.is_file() else 0
+                if size > 0:
+                    if size != last_size:
+                        last_size, stable_at = size, now
+                    elif exited or now - stable_at >= 2:
+                        break  # written and settled
+                elif exited:
+                    detail = "browser exited without producing a PDF"
+                    break
+                if now - start > 120:
+                    detail = "timed out after 120s"
+                    break
+                time.sleep(0.3)
+        except OSError as e:
+            detail = str(e)
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(10)
+                    except subprocess.TimeoutExpired:
+                        pass
+        if not detail and pdf_path.is_file() and pdf_path.stat().st_size > 0:
+            return True
+        if not detail:
+            try:
+                lines = log.read_text(errors="replace").strip().splitlines()
+                detail = lines[-1] if lines else "no output from the browser"
+            except OSError:
+                detail = "no output from the browser"
+    warn(f"PDF generation failed: {detail}")
+    warn("The HTML report is unaffected. If this browser keeps failing, set")
+    warn("POD_AUDIT_CHROME=/path/to/another/browser or [report].pdf = false.")
+    return False
 
 
 # --------------------------------------------------------------------------
