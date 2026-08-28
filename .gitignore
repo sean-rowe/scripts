@@ -1,0 +1,8 @@
+# Real config may contain the Rally API key / Bitbucket credentials
+pod-audit.toml
+
+# Generated daily reports and burndown history
+reports/
+pod-audit-sample.pdf
+
+__pycache__/

@@ -1,0 +1,73 @@
+# pod-audit.toml — configuration for pod-audit.py
+#
+# Copy this file to pod-audit.toml, fill it in, and keep it OUT of git if you
+# put secrets in it (or leave secrets blank and export the env vars instead).
+
+[pod]
+name = "POD 6"
+# Names as they appear in Rally (Owner display name). Entries containing "@"
+# are matched against the Rally username/email instead of the display name.
+devs = [
+  "Jane Developer",
+  "John Coder",
+  "sam.lee@example.com",
+]
+
+[sprint]
+# Sprint numbering anchor: sprint `current` started on `anchor_start`.
+# The script computes today's sprint from this, so you only ever need to
+# update these if your sprint cadence changes.
+current = 44
+anchor_start = 2026-08-24   # first day of sprint 44 (a TOML date, no quotes)
+length_days = 14            # two-week sprints
+previous = 2                # how many earlier sprints to include in the audit
+
+[rally]
+server = "https://rally1.rallydev.com"
+# API key (Rally > Settings > API Keys). Leave blank and export RALLY_API_KEY
+# if you'd rather not keep it in the file.
+api_key = ""
+# Optional scoping. Give ObjectIDs (the number in the Rally URL) or leave
+# blank to search your default workspace/project.
+workspace = ""
+project = ""
+# How iterations are named in Rally; {n} is replaced with the sprint number.
+iteration_name_format = "Sprint {n}"
+# Custom field that holds acceptance criteria. If it's empty or missing the
+# script falls back to extracting an "Acceptance Criteria" section (or bullet
+# list) from the story Description.
+acceptance_criteria_field = "c_AcceptanceCriteria"
+
+[git]
+# Local clones to search for story branches (branch names are expected to
+# contain the story id, e.g. feature/US123456-do-the-thing).
+repos = [
+  "~/Projects/pinyridgelabs/some-repo",
+  "~/Projects/pinyridgelabs/another-repo",
+]
+remote = "origin"
+
+[bitbucket]
+# Only needed for repos hosted on bitbucket.org. GitHub repos use the `gh`
+# CLI and need no config here. Env fallbacks: BITBUCKET_TOKEN, or
+# BITBUCKET_USER + BITBUCKET_APP_PASSWORD.
+token = ""
+user = ""
+app_password = ""
+
+[ai]
+# Use the `claude` CLI to score each acceptance criterion against the story
+# branch's diff (0-100%). Slower and uses tokens; without it the script
+# applies a story-level heuristic (task ToDo %, PR/branch state) instead.
+enabled = false
+max_diff_chars = 12000
+
+[risks]
+stale_pr_days = 3        # open PR untouched this many days -> risk
+max_pr_comments = 10     # PR with more comments than this -> churn risk
+no_branch_after_pct = 50 # no branch when sprint is this % elapsed -> risk
+stale_story_days = 3     # In-Progress story untouched this many days -> risk
+
+[report]
+output_dir = "reports"                 # HTML reports land here, one per day
+history_file = "reports/history.json"  # burndown snapshots accumulate here
