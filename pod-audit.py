@@ -105,8 +105,15 @@ def load_config(path):
             f"Config file not found: {p}\n"
             f"       Copy pod-audit.example.toml to {p.name} and fill it in."
         )
-    with open(p, "rb") as f:
-        user_cfg = tomllib.load(f)
+    try:
+        with open(p, "rb") as f:
+            user_cfg = tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        die(
+            f"Cannot parse {p}: {e}\n"
+            "       Note: TOML paths need no shell escaping — write spaces as-is\n"
+            '       ("/Users/me/POD 6/repo", not "/Users/me/POD\\ 6/repo").'
+        )
     cfg = {}
     for section, defaults in DEFAULTS.items():
         cfg[section] = {**defaults, **user_cfg.get(section, {})}
