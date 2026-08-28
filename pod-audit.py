@@ -161,11 +161,12 @@ def load_config(path):
     if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
         die("[git].repos must be a list of directory paths")
     try:
-        cfg["rally"]["iteration_name_format"].format(n=1)
+        cfg["rally"]["iteration_name_format"].format(n=1, year=2026)
     except (KeyError, IndexError, ValueError):
         die(
             f"[rally].iteration_name_format is invalid: "
-            f"{cfg['rally']['iteration_name_format']!r} (use {{n}} for the sprint number)"
+            f"{cfg['rally']['iteration_name_format']!r} "
+            "(use {n} for the sprint number, {year} for the sprint's start year)"
         )
     cfg["rally"]["api_key"] = cfg["rally"]["api_key"] or os.environ.get("RALLY_API_KEY", "")
     bb = cfg["bitbucket"]
@@ -193,7 +194,8 @@ def sprint_window(cfg, n):
 
 
 def iteration_name(cfg, n):
-    return cfg["rally"]["iteration_name_format"].format(n=n)
+    start, _ = sprint_window(cfg, n)
+    return cfg["rally"]["iteration_name_format"].format(n=n, year=start.year)
 
 
 # --------------------------------------------------------------------------

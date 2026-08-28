@@ -31,8 +31,10 @@ api_key = ""
 # blank to search your default workspace/project.
 workspace = ""
 project = ""
-# How iterations are named in Rally; {n} is replaced with the sprint number.
-iteration_name_format = "Sprint {n}"
+# How iterations are named in Rally; {n} is replaced with the sprint number
+# and {year} with the year the sprint starts. Run --lookup on a known story
+# to see the exact Iteration.Name your Rally uses.
+iteration_name_format = "Sprint {n} {year}"
 # Custom field that holds acceptance criteria. If it's empty or missing the
 # script falls back to extracting an "Acceptance Criteria" section (or bullet
 # list) from the story Description.
