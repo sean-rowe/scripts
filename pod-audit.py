@@ -207,7 +207,7 @@ def iteration_name(cfg, n):
 STORY_FETCH = (
     "FormattedID,Name,ObjectID,ScheduleState,PlanEstimate,ToDo,"
     "TaskEstimateTotal,TaskRemainingTotal,Blocked,BlockedReason,Description,"
-    "Discussion,LastUpdateDate,Iteration,Owner,DisplayName"
+    "Discussion,LastUpdateDate,AcceptedDate,Iteration,Owner,DisplayName"
 )
 
 
@@ -372,6 +372,7 @@ class Story:
     blocked_reason: str
     discussions: int
     last_update: dt.date | None
+    accepted: dt.date | None
     acs: list
     ac_scores: list = field(default_factory=list)   # [(percent, note)] per AC
     branches: list = field(default_factory=list)
@@ -397,14 +398,16 @@ def _num(v):
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def build_story(rally, kind, raw):
-    lu = None
-    raw_lu = raw.get("LastUpdateDate")
-    if isinstance(raw_lu, str):
+def _rally_date(v):
+    if isinstance(v, str):
         try:
-            lu = dt.datetime.fromisoformat(raw_lu.replace("Z", "+00:00")).date()
+            return dt.datetime.fromisoformat(v.replace("Z", "+00:00")).date()
         except ValueError:
-            lu = None
+            pass
+    return None
+
+
+def build_story(rally, kind, raw):
     disc = raw.get("Discussion")
     return Story(
         kind=kind,
@@ -418,7 +421,8 @@ def build_story(rally, kind, raw):
         blocked=bool(raw.get("Blocked")),
         blocked_reason=str(raw.get("BlockedReason") or ""),
         discussions=disc.get("Count", 0) if isinstance(disc, dict) else 0,
-        last_update=lu,
+        last_update=_rally_date(raw.get("LastUpdateDate")),
+        accepted=_rally_date(raw.get("AcceptedDate")),
         acs=parse_acceptance_criteria(raw, rally.ac_field),
     )
 
@@ -796,22 +800,20 @@ def record_snapshot(history, today, sprint_n, per_dev_current):
     return snap
 
 
-def sprint_series(history, sprint_n, start, key, dev=None):
-    """[(day_index, remaining)] for snapshots belonging to this sprint."""
+def burndown_series(stories, start, cap):
+    """[(day_index, remaining_points)] for each sprint day up to `cap`,
+    reconstructed from Rally AcceptedDate: remaining on a day = planned
+    total minus the points of everything accepted by that day. This gives
+    full historical curves without needing the script to have run daily."""
+    total = total_points(stories)
     out = []
-    for date_str, snap in sorted(history["snapshots"].items()):
-        if not isinstance(snap, dict) or snap.get("sprint") != sprint_n:
-            continue
-        try:
-            day = (dt.date.fromisoformat(date_str) - start).days
-        except ValueError:
-            continue
-        if dev is None:
-            val = snap.get("pod", {}).get(key)
-        else:
-            val = snap.get("devs", {}).get(dev, {}).get(key)
-        if val is not None:
-            out.append((day, val))
+    for d in range((cap - start).days + 1):
+        day = start + dt.timedelta(days=d)
+        done = sum(
+            s.points or 0 for s in stories
+            if (s.accepted and s.accepted <= day) or (s.done and not s.accepted)
+        )
+        out.append((d, round(total - done, 2)))
     return out
 
 
@@ -858,15 +860,19 @@ def burndown_svg(title, length_days, total, actual, today_day=None, width=560, h
         f'<line x1="{x(0):.1f}" y1="{y(total):.1f}" x2="{x(last_day):.1f}" y2="{y(0):.1f}" class="ideal"/>'
     )
     # actual line + points. The line is anchored at (day 0, sprint total) —
-    # true by definition — so a sprint with few snapshots still reads as a
-    # line instead of a floating dot; dots mark only real snapshots.
+    # true by definition — and dots mark only the days where remaining
+    # changed (i.e. work was accepted), plus the endpoint.
     if actual:
         line = list(actual)
         if line[0][0] > 0:
             line.insert(0, (0, total))
         pts = " ".join(f"{x(d):.1f},{y(v):.1f}" for d, v in line)
         parts.append(f'<polyline points="{pts}" class="actual"/>')
-        for d, v in actual:
+        dots = [
+            pt for i, pt in enumerate(actual)
+            if i == len(actual) - 1 or i == 0 or actual[i][1] != actual[i - 1][1]
+        ]
+        for d, v in dots:
             parts.append(f'<circle cx="{x(d):.1f}" cy="{y(v):.1f}" r="3" class="dot"/>')
         label_y = max(y(actual[-1][1]) - 6, mt + 10)
         parts.append(
@@ -1021,7 +1027,7 @@ def render_story(story, sprint_n, current_sprint):
     return "".join(h)
 
 
-def render_report(cfg, today, current_sprint, sprints, per_dev, history):
+def render_report(cfg, today, current_sprint, sprints, per_dev):
     pod = cfg["pod"]["name"]
     length = cfg["sprint"]["length_days"]
     start, end = sprint_window(cfg, current_sprint)
@@ -1072,17 +1078,22 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, history):
         f"<th class='num'>{len(all_risks)}</th></tr></table>"
     )
 
-    # --- Pod burndown
-    pod_actual = sprint_series(history, current_sprint, start, "remaining")
-    pod_total = max(
-        [total_points(all_current)]
-        + [snap.get("pod", {}).get("total", 0)
-           for snap in history["snapshots"].values() if snap.get("sprint") == current_sprint]
-    )
-    h.append("<h2>Burndown</h2><div class='charts'><div>")
-    h.append(burndown_svg(f"Pod — {it_name}", length, pod_total, pod_actual,
-                          today_day=(today - start).days))
-    h.append("</div></div>")
+    # --- Pod burndown: one chart per sprint, newest first, reconstructed
+    # from Rally acceptance dates.
+    h.append("<h2>Burndown</h2><div class='charts'>")
+    for n in reversed(sprints):
+        s_start, s_end = sprint_window(cfg, n)
+        cap = min(today, s_end)
+        sprint_stories = [s for dev in per_dev.values() for s in dev.get(n, [])]
+        if not sprint_stories and n != current_sprint:
+            continue
+        h.append("<div>" + burndown_svg(
+            f"Pod — {iteration_name(cfg, n)}", length,
+            total_points(sprint_stories),
+            burndown_series(sprint_stories, s_start, cap),
+            today_day=(today - s_start).days if n == current_sprint else None,
+        ) + "</div>")
+    h.append("</div>")
 
     # --- Blockers & risks up front
     h.append("<h2>Blockers &amp; risks</h2>")
@@ -1097,20 +1108,19 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, history):
     # --- Per-dev sections
     for dev, by_sprint in per_dev.items():
         h.append(f"<h2>{esc(dev)}</h2>")
-        cur = by_sprint.get(current_sprint, [])
-        dev_total = max(
-            [total_points(cur)]
-            + [snap.get("devs", {}).get(dev, {}).get("total", 0)
-               for snap in history["snapshots"].values()
-               if snap.get("sprint") == current_sprint]
-        )
-        h.append("<div class='charts'><div>")
-        h.append(burndown_svg(
-            f"{dev} — {it_name}", length, dev_total,
-            sprint_series(history, current_sprint, start, "remaining", dev=dev),
-            today_day=(today - start).days,
-        ))
-        h.append("</div></div>")
+        h.append("<div class='charts'>")
+        for n in reversed(sprints):
+            s_start, s_end = sprint_window(cfg, n)
+            dev_stories = by_sprint.get(n, [])
+            if not dev_stories and n != current_sprint:
+                continue
+            h.append("<div>" + burndown_svg(
+                f"{esc(dev)} — {iteration_name(cfg, n)}", length,
+                total_points(dev_stories),
+                burndown_series(dev_stories, s_start, min(today, s_end)),
+                today_day=(today - s_start).days if n == current_sprint else None,
+            ) + "</div>")
+        h.append("</div>")
         for n in sprints:
             stories = by_sprint.get(n, [])
             if n != current_sprint:
@@ -1535,7 +1545,7 @@ def main():
     except OSError as e:
         die(f"Cannot write history file {history_path}: {e}")
 
-    html_out = render_report(cfg, today, current_sprint, sprints, per_dev, history)
+    html_out = render_report(cfg, today, current_sprint, sprints, per_dev)
     slug = re.sub(r"[^a-z0-9]+", "-", cfg["pod"]["name"].lower()).strip("-") or "pod"
     try:
         out_dir = (cfg["_dir"] / cfg["report"]["output_dir"]).expanduser()
