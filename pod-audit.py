@@ -118,17 +118,42 @@ def load_config(path):
     for section, defaults in DEFAULTS.items():
         cfg[section] = {**defaults, **user_cfg.get(section, {})}
 
-    if not cfg["pod"]["devs"]:
-        die("[pod].devs is empty — list the devs in the pod")
+    devs = cfg["pod"]["devs"]
+    if not isinstance(devs, list) or not devs or not all(
+        isinstance(d, str) and d.strip() for d in devs
+    ):
+        die("[pod].devs must be a non-empty list of names")
     for key in ("current", "anchor_start"):
         if key not in cfg["sprint"]:
             die(f"[sprint].{key} is required")
-    anchor = cfg["sprint"]["anchor_start"]
+    s = cfg["sprint"]
+    if not isinstance(s["current"], int):
+        die(f"[sprint].current must be a whole number, got {s['current']!r}")
+    if not isinstance(s["length_days"], int) or s["length_days"] < 2:
+        die(f"[sprint].length_days must be a whole number >= 2, got {s['length_days']!r}")
+    if not isinstance(s["previous"], int) or s["previous"] < 0:
+        die(f"[sprint].previous must be a whole number >= 0, got {s['previous']!r}")
+    anchor = s["anchor_start"]
     if isinstance(anchor, str):
-        anchor = dt.date.fromisoformat(anchor)
+        try:
+            anchor = dt.date.fromisoformat(anchor)
+        except ValueError:
+            die(f"[sprint].anchor_start is not a date: {anchor!r} (write 2026-08-24, unquoted)")
     elif isinstance(anchor, dt.datetime):
         anchor = anchor.date()
+    if not isinstance(anchor, dt.date):
+        die(f"[sprint].anchor_start is not a date: {anchor!r} (write 2026-08-24, unquoted)")
     cfg["sprint"]["anchor_start"] = anchor
+    repos = cfg["git"]["repos"]
+    if not isinstance(repos, list) or not all(isinstance(r, str) for r in repos):
+        die("[git].repos must be a list of directory paths")
+    try:
+        cfg["rally"]["iteration_name_format"].format(n=1)
+    except (KeyError, IndexError, ValueError):
+        die(
+            f"[rally].iteration_name_format is invalid: "
+            f"{cfg['rally']['iteration_name_format']!r} (use {{n}} for the sprint number)"
+        )
     cfg["rally"]["api_key"] = cfg["rally"]["api_key"] or os.environ.get("RALLY_API_KEY", "")
     bb = cfg["bitbucket"]
     bb["token"] = bb["token"] or os.environ.get("BITBUCKET_TOKEN", "")
@@ -194,11 +219,20 @@ class Rally:
         req = urllib.request.Request(url, headers={"ZSESSIONID": self.key})
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
-                return json.load(resp)
+                data = json.load(resp)
         except urllib.error.HTTPError as e:
-            die(f"Rally API error {e.code} for {endpoint}: {e.read().decode(errors='replace')[:300]}")
-        except urllib.error.URLError as e:
-            die(f"Cannot reach Rally at {self.server}: {e.reason}")
+            try:
+                body = e.read().decode(errors="replace")[:300]
+            except OSError:
+                body = ""
+            die(f"Rally API error {e.code} for {endpoint}: {body}")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            die(f"Cannot reach Rally at {self.server}: {e}")
+        except json.JSONDecodeError as e:
+            die(f"Rally returned invalid JSON for {endpoint}: {e}")
+        if not isinstance(data, dict):
+            die(f"Rally returned an unexpected response for {endpoint}")
+        return data
 
     def query(self, entity, query, fetch):
         results, start = [], 1
@@ -210,7 +244,9 @@ class Rally:
                 "start": str(start),
                 **self.scope,
             }
-            qr = self._get(entity, params).get("QueryResult", {})
+            qr = self._get(entity, params).get("QueryResult")
+            if not isinstance(qr, dict):
+                die(f"Rally response for {entity} has no QueryResult")
             errors = qr.get("Errors") or []
             if errors:
                 die(f"Rally query failed for {entity}: {'; '.join(errors)}")
@@ -334,22 +370,32 @@ class Story:
         return [pr for b in self.branches for pr in b.prs]
 
 
+def _num(v):
+    """A float, or None for anything that isn't a real number."""
+    return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
 def build_story(rally, kind, raw):
     lu = None
-    if raw.get("LastUpdateDate"):
-        lu = dt.datetime.fromisoformat(raw["LastUpdateDate"].replace("Z", "+00:00")).date()
+    raw_lu = raw.get("LastUpdateDate")
+    if isinstance(raw_lu, str):
+        try:
+            lu = dt.datetime.fromisoformat(raw_lu.replace("Z", "+00:00")).date()
+        except ValueError:
+            lu = None
+    disc = raw.get("Discussion")
     return Story(
         kind=kind,
-        sid=raw.get("FormattedID", "?"),
-        name=raw.get("Name", ""),
+        sid=str(raw.get("FormattedID") or "?"),
+        name=str(raw.get("Name") or ""),
         url=rally.story_url(kind, raw.get("ObjectID", "")),
-        state=raw.get("ScheduleState", "?"),
-        points=raw.get("PlanEstimate"),
-        todo_hours=raw.get("ToDo"),
-        task_est=raw.get("TaskEstimateTotal"),
+        state=str(raw.get("ScheduleState") or "?"),
+        points=_num(raw.get("PlanEstimate")),
+        todo_hours=_num(raw.get("ToDo")),
+        task_est=_num(raw.get("TaskEstimateTotal")),
         blocked=bool(raw.get("Blocked")),
-        blocked_reason=raw.get("BlockedReason") or "",
-        discussions=(raw.get("Discussion") or {}).get("Count", 0),
+        blocked_reason=str(raw.get("BlockedReason") or ""),
+        discussions=disc.get("Count", 0) if isinstance(disc, dict) else 0,
         last_update=lu,
         acs=parse_acceptance_criteria(raw, rally.ac_field),
     )
@@ -365,7 +411,7 @@ def run(cmd, cwd=None, timeout=120, input_=None):
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, input=input_
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+    except (subprocess.TimeoutExpired, OSError) as e:
         return 1, "", str(e)
 
 
@@ -464,16 +510,27 @@ def github_prs(repo_path, branch):
     if rc != 0:
         warn(f"gh pr list failed in {repo_path.name}: {err.splitlines()[0] if err else rc}")
         return []
+    try:
+        items = json.loads(out or "[]")
+    except json.JSONDecodeError:
+        warn(f"Unexpected gh output in {repo_path.name}; skipping PR lookup")
+        return []
     prs = []
-    for item in json.loads(out or "[]"):
+    for item in items:
+        number = item.get("number") if isinstance(item, dict) else None
+        if number is None:
+            continue
         rc, detail, _ = run(
-            ["gh", "pr", "view", str(item["number"]), "--json",
+            ["gh", "pr", "view", str(number), "--json",
              "title,state,url,isDraft,createdAt,updatedAt,reviewDecision,comments,reviews"],
             cwd=repo_path,
         )
         if rc != 0:
             continue
-        d = json.loads(detail)
+        try:
+            d = json.loads(detail)
+        except json.JSONDecodeError:
+            continue
         comments = len(d.get("comments") or []) + len(
             [r for r in d.get("reviews") or [] if (r.get("body") or "").strip()]
         )
@@ -516,6 +573,8 @@ def bitbucket_prs(cfg, remote_url, branch):
         with urllib.request.urlopen(req, timeout=30) as resp:
             listing = json.load(resp)
         for v in listing.get("values", []):
+            if not isinstance(v, dict) or "id" not in v:
+                continue
             detail_url = (
                 f"https://api.bitbucket.org/2.0/repositories/{slug}/pullrequests/{v['id']}"
             )
@@ -534,8 +593,9 @@ def bitbucket_prs(cfg, remote_url, branch):
                 created=(d.get("created_on") or "")[:10],
                 updated=(d.get("updated_on") or "")[:10],
             ))
-    except urllib.error.URLError as e:
-        warn(f"Bitbucket PR lookup failed for {slug}: {e}")
+    except (urllib.error.URLError, TimeoutError, OSError,
+            json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+        warn(f"Bitbucket PR lookup failed for {slug}: {e.__class__.__name__}: {e}")
     return prs
 
 
@@ -671,8 +731,21 @@ def assess_risks(story, sprint_n, current_sprint, elapsed_pct, cfg, prev_story_s
 
 def load_history(path):
     if path.is_file():
-        with open(path) as f:
-            return json.load(f)
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("snapshots"), dict):
+                return data
+            warn(f"History file {path} has an unexpected shape; starting fresh")
+        except (json.JSONDecodeError, OSError) as e:
+            warn(f"Cannot read history file {path} ({e}); starting fresh")
+        # Preserve the bad file so past burndown data isn't silently destroyed.
+        backup = path.with_name(path.name + ".corrupt")
+        try:
+            path.replace(backup)
+            warn(f"Old history preserved at {backup}")
+        except OSError:
+            pass
     return {"snapshots": {}}
 
 
@@ -705,9 +778,12 @@ def sprint_series(history, sprint_n, start, key, dev=None):
     """[(day_index, remaining)] for snapshots belonging to this sprint."""
     out = []
     for date_str, snap in sorted(history["snapshots"].items()):
-        if snap.get("sprint") != sprint_n:
+        if not isinstance(snap, dict) or snap.get("sprint") != sprint_n:
             continue
-        day = (dt.date.fromisoformat(date_str) - start).days
+        try:
+            day = (dt.date.fromisoformat(date_str) - start).days
+        except ValueError:
+            continue
         if dev is None:
             val = snap.get("pod", {}).get(key)
         else:
@@ -1063,7 +1139,13 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    today = dt.date.fromisoformat(args.date) if args.date else dt.date.today()
+    if args.date:
+        try:
+            today = dt.date.fromisoformat(args.date)
+        except ValueError:
+            die(f"--date must be YYYY-MM-DD, got {args.date!r}")
+    else:
+        today = dt.date.today()
 
     current_sprint = sprint_for_date(cfg, today)
     sprints = list(range(current_sprint - cfg["sprint"]["previous"], current_sprint + 1))
@@ -1103,40 +1185,69 @@ def main():
             stories = [build_story(rally, kind, raw) for kind, raw in rally.stories_for(dev, it)]
             stories.sort(key=lambda s: s.sid)
             for story in stories:
-                if index:
-                    for path, branch, default, url in index.find(story.sid):
-                        b = branch_stats(index, path, branch, default)
-                        b.prs = find_prs(cfg, path, url, branch)
-                        story.branches.append(b)
-                if ai_enabled and story.acs and story.branches and not story.done:
-                    path, branch, default, _ = index.find(story.sid)[0]
-                    info(f"AI-scoring ACs for {story.sid}...")
-                    diff = branch_diff_text(index, path, branch, default, cfg["ai"]["max_diff_chars"])
-                    scores = ai_score_acs(story, diff, cfg)
-                    if scores:
-                        story.ac_scores = scores
+                # Enrichment failures (a broken repo, gh hiccup, AI parse) must
+                # not sink the whole report — warn and carry on with less data.
+                try:
+                    if index:
+                        for path, branch, default, url in index.find(story.sid):
+                            b = branch_stats(index, path, branch, default)
+                            b.prs = find_prs(cfg, path, url, branch)
+                            story.branches.append(b)
+                    if ai_enabled and story.acs and story.branches and not story.done:
+                        path, branch, default, _ = index.find(story.sid)[0]
+                        info(f"AI-scoring ACs for {story.sid}...")
+                        diff = branch_diff_text(index, path, branch, default,
+                                                cfg["ai"]["max_diff_chars"])
+                        scores = ai_score_acs(story, diff, cfg)
+                        if scores:
+                            story.ac_scores = scores
+                except Exception as e:
+                    warn(f"Branch/PR enrichment failed for {story.sid}: "
+                         f"{e.__class__.__name__}: {e}")
                 prev_state = (prev_snap or {}).get("stories", {}).get(story.sid)
+                if not isinstance(prev_state, dict):
+                    prev_state = None
                 assess_risks(story, n, current_sprint, elapsed_pct, cfg, prev_state, today)
             per_dev[dev][n] = stories
 
     # Snapshot for burndown, then render.
     record_snapshot(history, today, current_sprint,
                     {dev: sp.get(current_sprint, []) for dev, sp in per_dev.items()})
-    history_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(history_path, "w") as f:
-        json.dump(history, f, indent=1)
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(history_path, "w") as f:
+            json.dump(history, f, indent=1)
+    except OSError as e:
+        die(f"Cannot write history file {history_path}: {e}")
 
     html_out = render_report(cfg, today, current_sprint, sprints, per_dev, history)
-    out_dir = (cfg["_dir"] / cfg["report"]["output_dir"]).expanduser()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    slug = re.sub(r"[^a-z0-9]+", "-", cfg["pod"]["name"].lower()).strip("-")
-    report_path = out_dir / f"{slug}-audit-{today.isoformat()}.html"
-    report_path.write_text("<!doctype html>\n<meta charset='utf-8'>\n" + html_out)
+    slug = re.sub(r"[^a-z0-9]+", "-", cfg["pod"]["name"].lower()).strip("-") or "pod"
+    try:
+        out_dir = (cfg["_dir"] / cfg["report"]["output_dir"]).expanduser()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = out_dir / f"{slug}-audit-{today.isoformat()}.html"
+        report_path.write_text("<!doctype html>\n<meta charset='utf-8'>\n" + html_out)
+    except OSError as e:
+        die(f"Cannot write report to {cfg['report']['output_dir']}: {e}")
 
     print_summary(cfg, today, current_sprint, per_dev, report_path)
     if args.open:
-        webbrowser.open(report_path.as_uri())
+        try:
+            webbrowser.open(report_path.as_uri())
+        except Exception as e:
+            warn(f"Could not open the report in a browser: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.", file=sys.stderr)
+        sys.exit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        if os.environ.get("POD_AUDIT_DEBUG"):
+            raise
+        die(f"Unexpected error: {e.__class__.__name__}: {e} "
+            f"(set POD_AUDIT_DEBUG=1 for a full traceback)")
