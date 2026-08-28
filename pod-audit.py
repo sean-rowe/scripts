@@ -819,7 +819,7 @@ def sprint_series(history, sprint_n, start, key, dev=None):
 # Charts (inline SVG)
 # --------------------------------------------------------------------------
 
-def burndown_svg(title, length_days, total, actual, width=560, height=260):
+def burndown_svg(title, length_days, total, actual, today_day=None, width=560, height=260):
     """actual: [(day_index, remaining_points)]"""
     ml, mr, mt, mb = 42, 14, 30, 30
     pw, ph = width - ml - mr, height - mt - mb
@@ -848,13 +848,23 @@ def burndown_svg(title, length_days, total, actual, width=560, height=260):
         parts.append(
             f'<text x="{x(d):.1f}" y="{height - 8}" class="xlab">{d + 1}</text>'
         )
+    # "today" marker
+    show_today = today_day is not None and 0 <= today_day <= last_day
+    if show_today:
+        tx = x(today_day)
+        parts.append(f'<line x1="{tx:.1f}" y1="{mt}" x2="{tx:.1f}" y2="{mt + ph}" class="today"/>')
     # ideal line
     parts.append(
         f'<line x1="{x(0):.1f}" y1="{y(total):.1f}" x2="{x(last_day):.1f}" y2="{y(0):.1f}" class="ideal"/>'
     )
-    # actual line + points
+    # actual line + points. The line is anchored at (day 0, sprint total) —
+    # true by definition — so a sprint with few snapshots still reads as a
+    # line instead of a floating dot; dots mark only real snapshots.
     if actual:
-        pts = " ".join(f"{x(d):.1f},{y(v):.1f}" for d, v in actual)
+        line = list(actual)
+        if line[0][0] > 0:
+            line.insert(0, (0, total))
+        pts = " ".join(f"{x(d):.1f},{y(v):.1f}" for d, v in line)
         parts.append(f'<polyline points="{pts}" class="actual"/>')
         for d, v in actual:
             parts.append(f'<circle cx="{x(d):.1f}" cy="{y(v):.1f}" r="3" class="dot"/>')
@@ -862,9 +872,10 @@ def burndown_svg(title, length_days, total, actual, width=560, height=260):
         parts.append(
             f'<text x="{x(actual[-1][0]) + 6:.1f}" y="{label_y:.1f}" class="now">{actual[-1][1]:g}</text>'
         )
+    today_leg = '&#160;&#160;<tspan class="todaylab">┊ today</tspan>' if show_today else ""
     parts.append(
         f'<text x="{width - mr}" y="18" text-anchor="end" class="legend">'
-        f'– – ideal &#160;&#160;● actual (pts remaining, by sprint day)</text>'
+        f'– – ideal &#160;&#160;● actual (pts remaining, by sprint day){today_leg}</text>'
     )
     parts.append("</svg>")
     return "".join(parts)
@@ -917,6 +928,8 @@ ul.risks { margin:0; padding-left:18px; } ul.risks li { margin:5px 0; }
 .chart .xlab { fill:var(--muted); font-size:10px; text-anchor:middle; }
 .chart .now { fill:var(--accent); font-size:11px; font-weight:700; }
 .chart .legend { fill:var(--muted); font-size:10px; }
+.chart .today { stroke:var(--warnc); stroke-width:1; stroke-dasharray:2 3; }
+.chart .todaylab { fill:var(--warnc); font-size:10px; }
 .charts { display:flex; flex-wrap:wrap; gap:16px; }
 .charts > div { flex:1 1 460px; }
 """
@@ -1067,7 +1080,8 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, history):
            for snap in history["snapshots"].values() if snap.get("sprint") == current_sprint]
     )
     h.append("<h2>Burndown</h2><div class='charts'><div>")
-    h.append(burndown_svg(f"Pod — {it_name}", length, pod_total, pod_actual))
+    h.append(burndown_svg(f"Pod — {it_name}", length, pod_total, pod_actual,
+                          today_day=(today - start).days))
     h.append("</div></div>")
 
     # --- Blockers & risks up front
@@ -1094,6 +1108,7 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, history):
         h.append(burndown_svg(
             f"{dev} — {it_name}", length, dev_total,
             sprint_series(history, current_sprint, start, "remaining", dev=dev),
+            today_day=(today - start).days,
         ))
         h.append("</div></div>")
         for n in sprints:
