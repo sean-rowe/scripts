@@ -38,6 +38,10 @@
 #                       name, that each dev matches a Rally user (with
 #                       suggestions), and that the git repos are reachable.
 #                       Run this first if a report comes back empty.
+#   --lookup <id>       Show how Rally names one known story's owner,
+#                       iteration, project and workspace — paste-ready values
+#                       for the config when --check alone doesn't explain an
+#                       empty report.
 #   --open              Open the HTML report in the default browser when done
 #
 # Run it daily from cron, e.g. weekdays at 7:30:
@@ -1188,6 +1192,44 @@ def print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path=Non
 # --check: diagnose why the audit might come back empty
 # --------------------------------------------------------------------------
 
+def run_lookup(cfg, sid):
+    """Show how Rally names everything about one known story, so the config
+    can be matched to reality (owner display name, iteration name, project,
+    workspace)."""
+    sid = sid.strip()
+    if not re.fullmatch(r"[A-Za-z]+[0-9]+", sid):
+        die(f"--lookup expects a FormattedID like US123456 or DE9911, got {sid!r}")
+    rally = Rally(cfg)
+    fetch = ("FormattedID,Name,ScheduleState,PlanEstimate,Owner,Iteration,"
+             "Project,Workspace,StartDate,EndDate")
+    found = False
+    for entity, kind in (("hierarchicalrequirement", "Story"), ("defect", "Defect")):
+        for r in rally.query(entity, f"(FormattedID = {sid})", fetch):
+            found = True
+            owner = r.get("Owner") or {}
+            it = r.get("Iteration") or {}
+            proj = r.get("Project") or {}
+            ws = r.get("Workspace") or {}
+            print(f"{kind} {r.get('FormattedID')}: {r.get('Name')}")
+            print(f"  ScheduleState:     {r.get('ScheduleState')}")
+            print(f"  Owner.DisplayName: {owner.get('_refObjectName')!r}")
+            print(f"  Iteration.Name:    {it.get('_refObjectName')!r}")
+            print(f"  Project:           {proj.get('_refObjectName')!r}")
+            print(f"  Workspace:         {ws.get('_refObjectName')!r}")
+            print()
+    if found:
+        print("To make the audit find items like this one:")
+        print("  - [pod].devs must contain the Owner.DisplayName string exactly as above")
+        print("  - [rally].iteration_name_format must produce the Iteration.Name above")
+        print("    (e.g. Iteration.Name 'Sprint 44' -> \"Sprint {n}\")")
+        print("  - if the Workspace isn't your default, set [rally].workspace")
+    else:
+        print(f"No story or defect with FormattedID {sid} is visible to this API key")
+        print("in the configured scope. If it exists, the workspace/project scope is")
+        print("wrong — set [rally].workspace (and [rally].project) in the config.")
+        sys.exit(1)
+
+
 def run_check(cfg, today, current_sprint):
     problems = 0
 
@@ -1293,6 +1335,8 @@ def main():
     ap.add_argument("--show-sprints", action="store_true")
     ap.add_argument("--check", action="store_true",
                     help="Diagnose the config against Rally (auth, iteration names, dev names)")
+    ap.add_argument("--lookup", metavar="US123456",
+                    help="Show how Rally names one known story's owner/iteration/workspace")
     ap.add_argument("--open", action="store_true", help="Open the report in a browser")
     args = ap.parse_args()
 
@@ -1313,6 +1357,10 @@ def main():
             s, e = sprint_window(cfg, n)
             tag = "  <- current" if n == current_sprint else ""
             print(f"{iteration_name(cfg, n)}: {s.isoformat()} .. {e.isoformat()}{tag}")
+        return
+
+    if args.lookup:
+        run_lookup(cfg, args.lookup)
         return
 
     if args.check:
