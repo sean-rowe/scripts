@@ -1170,6 +1170,7 @@ def html_to_pdf(html_path, pdf_path):
     # sign-in/policy dialogs or a profile lock (corporate Edge). So: run with
     # a throwaway profile, watch for the PDF file to appear and stop growing,
     # then reap the browser ourselves.
+    info(f"Rendering PDF with {Path(chrome).name}...")
     try:
         pdf_path.unlink(missing_ok=True)
     except OSError as e:
