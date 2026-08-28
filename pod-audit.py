@@ -20,6 +20,8 @@
 #
 # Each run appends a snapshot of remaining points to a history file; those
 # snapshots drive a pod burndown chart and one per dev in the HTML report.
+# A PDF copy of the report is produced alongside the HTML (rendered with a
+# headless Chromium-based browser so it keeps the exact same look).
 #
 # Usage:
 #   pod-audit.py [--config pod-audit.toml] [options]
@@ -29,7 +31,13 @@
 #   --date <YYYY-MM-DD> Pretend today is this date (testing / backfill)
 #   --no-ai             Skip claude-based AC scoring even if enabled in config
 #   --no-git            Skip branch/PR discovery (Rally data only)
+#   --no-pdf            Skip the PDF copy of the report
 #   --show-sprints      Print the computed sprint windows and exit
+#   --check             Diagnose the config against Rally: verifies the API
+#                       key, that the computed iteration exists under that
+#                       name, that each dev matches a Rally user (with
+#                       suggestions), and that the git repos are reachable.
+#                       Run this first if a report comes back empty.
 #   --open              Open the HTML report in the default browser when done
 #
 # Run it daily from cron, e.g. weekdays at 7:30:
@@ -44,6 +52,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -94,7 +103,7 @@ DEFAULTS = {
         "no_branch_after_pct": 50,
         "stale_story_days": 3,
     },
-    "report": {"output_dir": "reports", "history_file": "reports/history.json"},
+    "report": {"output_dir": "reports", "history_file": "reports/history.json", "pdf": True},
 }
 
 
@@ -255,6 +264,11 @@ class Rally:
             if len(results) >= total:
                 return results
             start += 100
+
+    def whoami(self):
+        data = self._get("user", {"fetch": "UserName,DisplayName,EmailAddress"})
+        user = data.get("User")
+        return user if isinstance(user, dict) else {}
 
     def stories_for(self, dev, sprint_name):
         owner_attr = "Owner.UserName" if "@" in dev else "Owner.DisplayName"
@@ -1095,10 +1109,54 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, history):
 
 
 # --------------------------------------------------------------------------
+# PDF: print the HTML report via a headless Chromium-based browser, which
+# renders the exact same CSS and SVG charts as the browser view.
+# --------------------------------------------------------------------------
+
+CHROME_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "google-chrome", "chromium", "chromium-browser", "msedge",
+]
+
+
+def find_chrome():
+    override = os.environ.get("POD_AUDIT_CHROME")
+    candidates = ([override] if override else []) + CHROME_CANDIDATES
+    for c in candidates:
+        p = Path(c).expanduser()
+        if p.is_file():
+            return str(p)
+        found = shutil.which(c)
+        if found:
+            return found
+    return None
+
+
+def html_to_pdf(html_path, pdf_path):
+    chrome = find_chrome()
+    if not chrome:
+        warn("No Chromium-based browser found for PDF output; skipping.")
+        warn("Install Chrome/Edge/Brave or set POD_AUDIT_CHROME=/path/to/browser.")
+        return False
+    rc, _, err = run(
+        [chrome, "--headless", "--disable-gpu", "--no-pdf-header-footer",
+         f"--print-to-pdf={pdf_path}", html_path.resolve().as_uri()],
+        timeout=120,
+    )
+    if rc != 0 or not pdf_path.is_file():
+        warn(f"PDF generation failed: {err.splitlines()[-1] if err else f'exit {rc}'}")
+        return False
+    return True
+
+
+# --------------------------------------------------------------------------
 # Terminal summary
 # --------------------------------------------------------------------------
 
-def print_summary(cfg, today, current_sprint, per_dev, report_path):
+def print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path=None):
     start, _ = sprint_window(cfg, current_sprint)
     day_no = (today - start).days + 1
     print()
@@ -1121,7 +1179,104 @@ def print_summary(cfg, today, current_sprint, per_dev, report_path):
     for s, (tag, msg) in risks:
         print(f"   ! {s.sid} [{tag}] {msg}")
     print(f"\n Report: {report_path}")
+    if pdf_path:
+        print(f" PDF:    {pdf_path}")
     print("=" * 62)
+
+
+# --------------------------------------------------------------------------
+# --check: diagnose why the audit might come back empty
+# --------------------------------------------------------------------------
+
+def run_check(cfg, today, current_sprint):
+    problems = 0
+
+    def ok(msg):
+        print(f" [ok] {msg}")
+
+    def bad(msg):
+        nonlocal problems
+        problems += 1
+        print(f" [!!] {msg}")
+
+    rally = Rally(cfg)
+    me = rally.whoami()
+    if me:
+        ok(f"Rally auth works: you are {me.get('DisplayName')} "
+           f"<{me.get('EmailAddress') or me.get('UserName')}>")
+    else:
+        bad("Rally accepted the API key but returned no user info")
+    scope = ", ".join(f"{k}={v}" for k, v in rally.scope.items() if k != "projectScopeDown")
+    print(f"      scope: {scope or 'default workspace/project for this API key'}")
+
+    # Does the computed iteration actually exist under that name?
+    it_name = iteration_name(cfg, current_sprint)
+    its = rally.query("iteration", f'(Name = "{it_name}")', "Name,StartDate,EndDate,Project")
+    if its:
+        projs = sorted({
+            (i.get("Project") or {}).get("_refObjectName", "?") for i in its
+            if isinstance(i, dict)
+        })
+        ok(f"Iteration '{it_name}' exists in project(s): {', '.join(projs)}")
+        w_start, _ = sprint_window(cfg, current_sprint)
+        starts = sorted({str(i.get("StartDate"))[:10] for i in its})
+        if w_start.isoformat() not in starts:
+            bad(f"Rally says '{it_name}' starts {', '.join(starts)} but the config "
+                f"computes {w_start} — adjust [sprint].anchor_start or [sprint].current")
+    else:
+        bad(f"No iteration named '{it_name}' — adjust [rally].iteration_name_format")
+        around = rally.query(
+            "iteration",
+            f'((StartDate <= "{today}") AND (EndDate >= "{today}"))',
+            "Name,StartDate,EndDate",
+        )
+        names = sorted({str(i.get("Name")) for i in around if isinstance(i, dict)})[:10]
+        if names:
+            print(f"      iterations covering today are named: {', '.join(repr(n) for n in names)}")
+        else:
+            print("      (no iteration in scope covers today at all — check workspace/project)")
+
+    # Does each configured dev resolve to a Rally user, and do they have work?
+    for dev in cfg["pod"]["devs"]:
+        attr = "UserName" if "@" in dev else "DisplayName"
+        users = rally.query("user", f'({attr} = "{dev}")', "UserName,DisplayName,EmailAddress")
+        if users:
+            u = users[0]
+            count = len(rally.stories_for(dev, it_name))
+            line = (f"{dev} -> {u.get('DisplayName')} "
+                    f"<{u.get('EmailAddress') or u.get('UserName')}>: "
+                    f"{count} item(s) in '{it_name}'")
+            ok(line) if count else bad(line + " — owner matches but owns nothing there")
+        else:
+            bad(f"No Rally user with {attr} = '{dev}'")
+            token = (dev.split("@")[0] if "@" in dev else dev.split()[-1]).strip()
+            close = rally.query(
+                "user", f'(DisplayName contains "{token}")',
+                "UserName,DisplayName,EmailAddress",
+            ) if token else []
+            if close:
+                sugg = "; ".join(
+                    f"\"{c.get('DisplayName')}\" <{c.get('EmailAddress') or c.get('UserName')}>"
+                    for c in close[:5] if isinstance(c, dict)
+                )
+                print(f"      did you mean: {sugg}")
+
+    # Git repos
+    if cfg["git"]["repos"]:
+        index = RepoIndex(cfg)
+        for path, meta in index.repos.items():
+            ok(f"repo {path.name}: {len(meta['heads'])} branch(es) on "
+               f"{index.remote} (default: {meta['default']})")
+        if not index.repos:
+            bad("None of the [git].repos entries is a usable git repo")
+    else:
+        print(" [--] No [git].repos configured; branch/PR reporting will be skipped")
+
+    print()
+    if problems:
+        print(f"{problems} problem(s) found — fix the config and re-run --check.")
+        sys.exit(1)
+    print("All checks passed.")
 
 
 # --------------------------------------------------------------------------
@@ -1134,7 +1289,10 @@ def main():
     ap.add_argument("--date", help="Pretend today is YYYY-MM-DD")
     ap.add_argument("--no-ai", action="store_true")
     ap.add_argument("--no-git", action="store_true")
+    ap.add_argument("--no-pdf", action="store_true", help="Skip the PDF copy of the report")
     ap.add_argument("--show-sprints", action="store_true")
+    ap.add_argument("--check", action="store_true",
+                    help="Diagnose the config against Rally (auth, iteration names, dev names)")
     ap.add_argument("--open", action="store_true", help="Open the report in a browser")
     args = ap.parse_args()
 
@@ -1155,6 +1313,10 @@ def main():
             s, e = sprint_window(cfg, n)
             tag = "  <- current" if n == current_sprint else ""
             print(f"{iteration_name(cfg, n)}: {s.isoformat()} .. {e.isoformat()}{tag}")
+        return
+
+    if args.check:
+        run_check(cfg, today, current_sprint)
         return
 
     start, _ = sprint_window(cfg, current_sprint)
@@ -1181,8 +1343,9 @@ def main():
         per_dev[dev] = {}
         for n in sprints:
             it = iteration_name(cfg, n)
-            info(f"Rally: stories for {dev} in {it}...")
-            stories = [build_story(rally, kind, raw) for kind, raw in rally.stories_for(dev, it)]
+            items = rally.stories_for(dev, it)
+            info(f"Rally: {dev} in {it}: {len(items)} item(s)")
+            stories = [build_story(rally, kind, raw) for kind, raw in items]
             stories.sort(key=lambda s: s.sid)
             for story in stories:
                 # Enrichment failures (a broken repo, gh hiccup, AI parse) must
@@ -1210,6 +1373,12 @@ def main():
                 assess_risks(story, n, current_sprint, elapsed_pct, cfg, prev_state, today)
             per_dev[dev][n] = stories
 
+    if not any(st for sp in per_dev.values() for st in sp.values()):
+        warn("No Rally stories or defects were found for ANY dev in ANY sprint.")
+        warn("Likely causes: iteration names don't match [rally].iteration_name_format,")
+        warn("dev names don't exactly match Rally display names, or wrong workspace/project.")
+        warn(f"Run  {sys.argv[0]} --check  to diagnose.")
+
     # Snapshot for burndown, then render.
     record_snapshot(history, today, current_sprint,
                     {dev: sp.get(current_sprint, []) for dev, sp in per_dev.items()})
@@ -1230,7 +1399,13 @@ def main():
     except OSError as e:
         die(f"Cannot write report to {cfg['report']['output_dir']}: {e}")
 
-    print_summary(cfg, today, current_sprint, per_dev, report_path)
+    pdf_path = None
+    if cfg["report"]["pdf"] and not args.no_pdf:
+        candidate = report_path.with_suffix(".pdf")
+        if html_to_pdf(report_path, candidate):
+            pdf_path = candidate
+
+    print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path)
     if args.open:
         try:
             webbrowser.open(report_path.as_uri())

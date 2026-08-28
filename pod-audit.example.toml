@@ -71,3 +71,6 @@ stale_story_days = 3     # In-Progress story untouched this many days -> risk
 [report]
 output_dir = "reports"                 # HTML reports land here, one per day
 history_file = "reports/history.json"  # burndown snapshots accumulate here
+# Also produce a PDF copy of each report (needs Chrome/Edge/Brave installed;
+# set POD_AUDIT_CHROME=/path/to/browser if yours lives somewhere unusual).
+pdf = true
