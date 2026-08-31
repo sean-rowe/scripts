@@ -434,6 +434,32 @@ EOF
   i=$((i + 1))
 done
 
+# --- Anything actually applied? ----------------------------------------------
+# Commits can all turn out to be patch-identical to changes already on the
+# target (promoted earlier under different hashes); git only detects that at
+# cherry-pick time. With nothing applied there is nothing to push or PR.
+APPLIED=$(git rev-list --count "${REMOTE}/${TO_BRANCH}..HEAD")
+if [[ "$APPLIED" -eq 0 ]]; then
+  rm -f "$STATE_FILE"
+  if git rev-parse --verify --quiet refs/heads/main >/dev/null; then
+    git switch -q main
+  elif git rev-parse --verify --quiet refs/heads/master >/dev/null; then
+    git switch -q master
+  else
+    git switch -q --detach "${REMOTE}/${TO_BRANCH}"
+  fi
+  git branch -D "$NEW_BRANCH" >/dev/null 2>&1 || true
+  echo
+  echo "=============================================================="
+  echo " NOTHING TO PROMOTE"
+  echo "=============================================================="
+  echo " Every change in PR(s) ${PRS[*]} is already on '$TO_BRANCH'"
+  echo " (the same patches landed there previously under different"
+  echo " commit hashes). No branch pushed, no PR created."
+  echo "=============================================================="
+  exit 0
+fi
+
 # --- Push --------------------------------------------------------------------
 PUSH_ARGS=(-u)
 if $FORCE_PUSH; then
@@ -469,7 +495,7 @@ if $CREATE_PR; then
   PR_BODY="${ORIG_BODY}${ORIG_BODY:+
 
 }---
-Cherry-picked $TOTAL commit(s) from PR(s) ${PRS[*]} onto ${TO_BRANCH} by $SCRIPT_NAME."
+Cherry-picked $APPLIED commit(s) from PR(s) ${PRS[*]} onto ${TO_BRANCH} by $SCRIPT_NAME."
   info "Creating pull request via gh..."
   PR_URL=$(gh pr create --base "$TO_BRANCH" --head "$NEW_BRANCH" \
              --title "$PR_TITLE" --body "$PR_BODY" 2>&1 \
@@ -488,7 +514,11 @@ echo "=============================================================="
 echo " SUCCESS"
 echo "=============================================================="
 echo " Promoted:      ${#PRS[@]} PR(s): ${PRS[*]}"
-echo " Cherry-picked: $TOTAL commit(s) onto $TO_BRANCH"
+if [[ "$APPLIED" -lt "$TOTAL" ]]; then
+  echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH ($((TOTAL - APPLIED)) already there, skipped)"
+else
+  echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH"
+fi
 echo " New branch:    $NEW_BRANCH  (pushed to $REMOTE)"
 if [[ -n "$PR_URL" ]]; then
   echo " Pull request:  $PR_URL"
