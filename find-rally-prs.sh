@@ -47,7 +47,8 @@ gh auth status >/dev/null 2>&1 || fail "gh is not authenticated. Run: gh auth lo
 REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) \
     || fail "Not inside a GitHub repo (or no remote configured). cd into the repo first."
 
-ID_LOWER=$(echo "$RALLY_ID" | tr '[:upper:]' '[:lower:]')
+[[ "$RALLY_ID" =~ ^[A-Za-z]+[0-9]+$ ]] \
+    || fail "Rally id must be letters followed by digits (e.g. US123456, DE45678), got '$RALLY_ID'"
 
 echo "🔍 Searching $REPO for PRs associated with $RALLY_ID ..." >&2
 $NUMBERS_ONLY || echo ""
@@ -57,20 +58,28 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 MATCHES="$TMP_DIR/matches.jsonl"   # one JSON object per match: {number, source}
 PR_DETAILS="$TMP_DIR/prs.json"
 
-# --- Strategy 1: branch name partial match (client-side, case insensitive) ---
+# The id must appear as a whole token: not preceded by a letter/digit and
+# not followed by another digit. This stops US85543 from matching a branch
+# for US855431, while still matching suffixed forms like US855431dev.
+ID_REGEX="(^|[^a-zA-Z0-9])${RALLY_ID}([^0-9]|\$)"
+
+# --- Strategy 1: branch name match (client-side, case insensitive) ----------
 gh pr list --state all --limit "$PR_SCAN_LIMIT" --json number,headRefName 2>/dev/null \
-    | jq --arg id "$ID_LOWER" \
-        '.[] | select(.headRefName | ascii_downcase | contains($id)) | {number, source: "branch"}' \
+    | jq --arg re "$ID_REGEX" \
+        '.[] | select(.headRefName | test($re; "i")) | {number, source: "branch"}' \
     >> "$MATCHES" \
     || echo "⚠️  Branch-name scan failed (continuing with other strategies)" >&2
 
 # --- Strategy 2: title/body search (server-side, case insensitive) ---
 # in:title,body is required: without it GitHub also matches PR comments,
 # which returns PRs where the ID was merely mentioned in a discussion.
+# The server search is substring-based, so re-check the boundary rule
+# client-side against the actual title/body text.
 gh pr list --state all --search "$RALLY_ID in:title,body" --limit 100 \
-    --json number \
-    --jq '.[] | {number, source: "title/body"}' \
-    >> "$MATCHES" 2>/dev/null \
+    --json number,title,body 2>/dev/null \
+    | jq --arg re "$ID_REGEX" \
+        '.[] | select((.title + " " + (.body // "")) | test($re; "i")) | {number, source: "title/body"}' \
+    >> "$MATCHES" \
     || echo "⚠️  Title/body search failed (continuing with other strategies)" >&2
 
 # --- Strategy 3: commit messages -> containing PRs ---
