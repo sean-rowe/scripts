@@ -46,7 +46,9 @@ gh pr list --state all --limit "$PR_SCAN_LIMIT" --json number,headRefName 2>/dev
     || echo "⚠️  Branch-name scan failed (continuing with other strategies)" >&2
 
 # --- Strategy 2: title/body search (server-side, case insensitive) ---
-gh pr list --state all --search "$RALLY_ID" --limit 100 \
+# in:title,body is required: without it GitHub also matches PR comments,
+# which returns PRs where the ID was merely mentioned in a discussion.
+gh pr list --state all --search "$RALLY_ID in:title,body" --limit 100 \
     --json number \
     --jq '.[] | {number, source: "title/body"}' \
     >> "$MATCHES" 2>/dev/null \
