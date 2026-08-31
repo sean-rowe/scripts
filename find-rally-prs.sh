@@ -6,13 +6,20 @@
 #   2. PR title/body search
 #   3. Commit messages (mapped back to their containing PRs)
 #
+# Only PRs whose BRANCH NAME contains the Rally id are the main results.
+# PRs that merely mention the id elsewhere (title, body, or commits) are
+# listed separately as an addendum — they are informational and are NOT
+# emitted in --numbers mode.
+#
 # Usage: ./find-rally-prs.sh <RALLY_ID> [--numbers]   (e.g. US123456 or DE45678)
 # Run from inside the git repo you want to search.
 #
 # --numbers: machine-readable mode for scripting — prints only the unique
-#            PR numbers (one per line) on stdout; progress goes to stderr.
+#            branch-matched PR numbers (one per line) on stdout; progress
+#            and the addendum note go to stderr.
 #
-# Exit codes: 0 = PRs found, 1 = none found, 2 = usage/environment error
+# Exit codes: 0 = branch-matched PRs found, 1 = none (even if addendum-only
+#             matches exist), 2 = usage/environment error
 
 set -euo pipefail
 
@@ -85,8 +92,18 @@ fi
 # --- Dedupe: collapse to unique PR numbers, keeping the set of match sources ---
 UNIQUE=$(jq -s 'group_by(.number) | map({number: .[0].number, sources: (map(.source) | unique | join(", "))})' "$MATCHES")
 
+# Main results: branch-name matches. Addendum: everything else.
+PRIMARY=$(echo "$UNIQUE" | jq '[.[] | select(.sources | contains("branch"))]')
+ADDENDUM=$(echo "$UNIQUE" | jq '[.[] | select(.sources | contains("branch") | not)]')
+P_COUNT=$(echo "$PRIMARY" | jq 'length')
+A_COUNT=$(echo "$ADDENDUM" | jq 'length')
+
 if $NUMBERS_ONLY; then
-    echo "$UNIQUE" | jq -r '.[].number'
+    if [[ "$A_COUNT" -gt 0 ]]; then
+        echo "ℹ️  Excluding $A_COUNT PR(s) that mention $RALLY_ID without it in the branch name: #$(echo "$ADDENDUM" | jq -r '[.[].number | tostring] | join(", #")')" >&2
+    fi
+    [[ "$P_COUNT" -gt 0 ]] || { echo "No PRs with $RALLY_ID in the branch name." >&2; exit 1; }
+    echo "$PRIMARY" | jq -r '.[].number'
     exit 0
 fi
 
@@ -95,15 +112,30 @@ echo "$UNIQUE" | jq -r '.[].number' | while read -r num; do
     gh pr view "$num" --json number,title,state,headRefName,url 2>/dev/null || true
 done | jq -s '.' > "$PR_DETAILS"
 
-# --- Merge details with match sources and print ---
-COUNT=$(echo "$UNIQUE" | jq 'length')
-echo "✅ Found $COUNT PR(s) for $RALLY_ID:"
-echo ""
+# --- Merge details with match sources and print a group ---
+print_group() {
+    jq -nr --argjson unique "$UNIQUE" --argjson group "$1" --slurpfile prs "$PR_DETAILS" '
+        ($unique | map({(.number | tostring): .sources}) | add) as $srcmap
+        | ($group | map(.number)) as $nums
+        | $prs[0][]
+        | select(.number as $n | $nums | index($n))
+        | "  #\(.number) [\(.state)] \(.title)\n      branch:  \(.headRefName)\n      matched: \($srcmap[.number | tostring])\n      \(.url)\n"
+    '
+}
 
-jq -nr --argjson unique "$UNIQUE" --slurpfile prs "$PR_DETAILS" '
-    ($unique | map({(.number | tostring): .sources}) | add) as $srcmap
-    | $prs[0][]
-    | "  #\(.number) [\(.state)] \(.title)\n      branch:  \(.headRefName)\n      matched: \($srcmap[.number | tostring])\n      \(.url)\n"
-'
+if [[ "$P_COUNT" -gt 0 ]]; then
+    echo "✅ Found $P_COUNT PR(s) with $RALLY_ID in the branch name:"
+    echo ""
+    print_group "$PRIMARY"
+else
+    echo "No PRs with $RALLY_ID in the branch name."
+fi
 
-exit 0
+if [[ "$A_COUNT" -gt 0 ]]; then
+    echo ""
+    echo "➕ Addendum: $A_COUNT PR(s) mention $RALLY_ID only in title/body/commits (not the branch name):"
+    echo ""
+    print_group "$ADDENDUM"
+fi
+
+[[ "$P_COUNT" -gt 0 ]] && exit 0 || exit 1
