@@ -45,6 +45,9 @@
 #   --branch-name <name>  Override the generated work branch name
 #   --no-pr               Skip opening the pull request
 #   --no-open             Don't open the created PR in the browser
+#   --keep-foreign-commits  With --story: keep commits whose message
+#                         references a different Rally id (they are
+#                         excluded by default, with a warning)
 #   --yes                 Skip confirmation of the resolved PR list
 #   --dry-run             Show what would happen without changing anything
 #   --continue            Resume an interrupted run after fixing conflicts
@@ -62,6 +65,7 @@ RELEASE_PREFIX="release-"
 BRANCH_OVERRIDE=""
 CREATE_PR=true
 OPEN_PR=true
+KEEP_FOREIGN=false
 ASSUME_YES=false
 DRY_RUN=false
 CONTINUE_RUN=false
@@ -89,6 +93,7 @@ while [[ $# -gt 0 ]]; do
     --branch-name)    BRANCH_OVERRIDE="${2:-}"; shift 2 ;;
     --no-pr)          CREATE_PR=false; shift ;;
     --no-open)        OPEN_PR=false; shift ;;
+    --keep-foreign-commits) KEEP_FOREIGN=true; shift ;;
     --yes)            ASSUME_YES=true; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
     --continue)       CONTINUE_RUN=true; shift ;;
@@ -254,6 +259,38 @@ if ! $CONTINUE_RUN; then
 
   [[ "$SKIPPED_MERGES" -gt 0 ]] && echo "WARNING: skipping $SKIPPED_MERGES merge commit(s)." >&2
   [[ "$SKIPPED_PRESENT" -gt 0 ]] && info "Skipping $SKIPPED_PRESENT commit(s) already on $TO_BRANCH."
+
+  # --- Foreign-story guard (only when promoting by --story) ------------------
+  # A story's PR can contain another story's commits (branch cut off another
+  # feature branch). Exclude commits whose message references a different
+  # Rally id and never this story's, unless --keep-foreign-commits.
+  if [[ -n "$STORY" && ${#COMMITS[@]} -gt 0 ]]; then
+    STORY_UP=$(echo "$STORY" | tr '[:lower:]' '[:upper:]')
+    FOREIGN=()
+    KEEP=()
+    for h in "${COMMITS[@]}"; do
+      IDS=$(git show -s --format=%B "$h" \
+              | grep -ioE '(US|DE|TA|TS)[0-9]{4,}' | tr '[:lower:]' '[:upper:]' \
+              | sort -u || true)
+      if [[ -n "$IDS" ]] && ! grep -qx "$STORY_UP" <<< "$IDS"; then
+        FOREIGN+=("$h")
+      else
+        KEEP+=("$h")
+      fi
+    done
+    if [[ ${#FOREIGN[@]} -gt 0 ]]; then
+      if $KEEP_FOREIGN; then
+        echo "WARNING: keeping ${#FOREIGN[@]} commit(s) that reference a different story (--keep-foreign-commits):" >&2
+        for h in "${FOREIGN[@]}"; do git show -s --format='    %h %s' "$h" >&2; done
+      else
+        echo "WARNING: excluding ${#FOREIGN[@]} commit(s) that reference a different story id:" >&2
+        for h in "${FOREIGN[@]}"; do git show -s --format='    %h %s' "$h" >&2; done
+        echo "         Re-run with --keep-foreign-commits if they really belong to $STORY." >&2
+        COMMITS=("${KEEP[@]:+${KEEP[@]}}")
+      fi
+    fi
+  fi
+
   [[ ${#COMMITS[@]} -gt 0 ]] || die "Nothing to promote: no cherry-pickable commits left."
 
   info "Commits to cherry-pick (${#COMMITS[@]}):"
