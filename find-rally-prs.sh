@@ -6,14 +6,26 @@
 #   2. PR title/body search
 #   3. Commit messages (mapped back to their containing PRs)
 #
-# Usage: ./find-rally-prs.sh <RALLY_ID>   (e.g. US123456 or DE45678)
+# Usage: ./find-rally-prs.sh <RALLY_ID> [--numbers]   (e.g. US123456 or DE45678)
 # Run from inside the git repo you want to search.
+#
+# --numbers: machine-readable mode for scripting — prints only the unique
+#            PR numbers (one per line) on stdout; progress goes to stderr.
 #
 # Exit codes: 0 = PRs found, 1 = none found, 2 = usage/environment error
 
 set -euo pipefail
 
-RALLY_ID=${1:?Usage: ./find-rally-prs.sh <RALLY_ID>  (e.g. US123456 or DE45678)}
+RALLY_ID=""
+NUMBERS_ONLY=false
+for arg in "$@"; do
+    case "$arg" in
+        --numbers) NUMBERS_ONLY=true ;;
+        -*) echo "Unknown option: $arg" >&2; exit 2 ;;
+        *) RALLY_ID="$arg" ;;
+    esac
+done
+[[ -n "$RALLY_ID" ]] || { echo "Usage: ./find-rally-prs.sh <RALLY_ID> [--numbers]  (e.g. US123456 or DE45678)" >&2; exit 2; }
 PR_SCAN_LIMIT=${PR_SCAN_LIMIT:-1000}
 
 fail() {
@@ -30,8 +42,8 @@ REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null) \
 
 ID_LOWER=$(echo "$RALLY_ID" | tr '[:upper:]' '[:lower:]')
 
-echo "🔍 Searching $REPO for PRs associated with $RALLY_ID ..."
-echo ""
+echo "🔍 Searching $REPO for PRs associated with $RALLY_ID ..." >&2
+$NUMBERS_ONLY || echo ""
 
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -66,12 +78,17 @@ for sha in $COMMIT_SHAS; do
 done
 
 if [[ ! -s "$MATCHES" ]]; then
-    echo "No PRs found for $RALLY_ID in $REPO."
+    echo "No PRs found for $RALLY_ID in $REPO." >&2
     exit 1
 fi
 
 # --- Dedupe: collapse to unique PR numbers, keeping the set of match sources ---
 UNIQUE=$(jq -s 'group_by(.number) | map({number: .[0].number, sources: (map(.source) | unique | join(", "))})' "$MATCHES")
+
+if $NUMBERS_ONLY; then
+    echo "$UNIQUE" | jq -r '.[].number'
+    exit 0
+fi
 
 # --- Fetch details for each unique PR ---
 echo "$UNIQUE" | jq -r '.[].number' | while read -r num; do
