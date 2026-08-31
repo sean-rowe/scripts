@@ -118,7 +118,7 @@ fi
 
 # --- Fetch details for each unique PR ---
 echo "$UNIQUE" | jq -r '.[].number' | while read -r num; do
-    gh pr view "$num" --json number,title,state,headRefName,url 2>/dev/null || true
+    gh pr view "$num" --json number,title,state,headRefName,baseRefName,mergedAt,url 2>/dev/null || true
 done | jq -s '.' > "$PR_DETAILS"
 
 # --- Merge details with match sources and print a group ---
@@ -128,7 +128,12 @@ print_group() {
         | ($group | map(.number)) as $nums
         | $prs[0][]
         | select(.number as $n | $nums | index($n))
-        | "  #\(.number) [\(.state)] \(.title)\n      branch:  \(.headRefName)\n      matched: \($srcmap[.number | tostring])\n      \(.url)\n"
+        | (if .state == "MERGED" then
+             "merged into \(.baseRefName) on \(.mergedAt[:10])"
+           else
+             "targets \(.baseRefName) (\(.state | ascii_downcase))"
+           end) as $dest
+        | "  #\(.number) [\(.state)] \(.title)\n      branch:  \(.headRefName)\n      into:    \($dest)\n      matched: \($srcmap[.number | tostring])\n      \(.url)\n"
     '
 }
 
