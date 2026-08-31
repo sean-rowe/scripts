@@ -45,9 +45,10 @@
 #   --branch-name <name>  Override the generated work branch name
 #   --no-pr               Skip opening the pull request
 #   --no-open             Don't open the created PR in the browser
-#   --keep-foreign-commits  With --story: keep commits whose message
-#                         references a different Rally id (they are
-#                         excluded by default, with a warning)
+#   --keep-foreign-commits  Keep commits whose message references a Rally
+#                         id but never the expected one (the --story id,
+#                         or the id in the commit's own PR branch name).
+#                         Such commits are excluded by default, loudly.
 #   --yes                 Skip confirmation of the resolved PR list
 #   --dry-run             Show what would happen without changing anything
 #   --continue            Resume an interrupted run after fixing conflicts
@@ -238,10 +239,13 @@ if ! $CONTINUE_RUN; then
   done
 
   # --- Collect commit hashes: per-PR oldest-first, deduped -------------------
+  # Each commit also carries the Rally id from its own PR's branch name, so
+  # the foreign-story guard below works even for explicit --pr runs.
   COMMITS=()
+  EXPECTED=()
   SKIPPED_MERGES=0
   SKIPPED_PRESENT=0
-  while IFS= read -r sha; do
+  while IFS=$'\t' read -r sha bid; do
     git cat-file -e "${sha}^{commit}" 2>/dev/null \
       || die "Commit $sha from the PRs is not available locally even after fetching"
     # skip merge commits
@@ -255,24 +259,36 @@ if ! $CONTINUE_RUN; then
       continue
     fi
     COMMITS+=("$sha")
-  done < <(echo "$PR_JSON" | jq -r '.[].commits[].oid' | awk '!seen[$0]++')
+    EXPECTED+=("${bid:-}")
+  done < <(echo "$PR_JSON" | jq -r '.[] as $pr
+      | (($pr.headRefName | [match("(us|de|ta|ts)[0-9]{4,}"; "i").string] | first) // "" | ascii_upcase) as $bid
+      | $pr.commits[] | .oid + "\t" + $bid' \
+    | awk -F'\t' '!seen[$1]++')
 
   [[ "$SKIPPED_MERGES" -gt 0 ]] && echo "WARNING: skipping $SKIPPED_MERGES merge commit(s)." >&2
   [[ "$SKIPPED_PRESENT" -gt 0 ]] && info "Skipping $SKIPPED_PRESENT commit(s) already on $TO_BRANCH."
 
-  # --- Foreign-story guard (only when promoting by --story) ------------------
-  # A story's PR can contain another story's commits (branch cut off another
-  # feature branch). Exclude commits whose message references a different
-  # Rally id and never this story's, unless --keep-foreign-commits.
-  if [[ -n "$STORY" && ${#COMMITS[@]} -gt 0 ]]; then
+  # --- Foreign-story guard ---------------------------------------------------
+  # A PR can contain another story's commits (branch cut off a different
+  # feature branch, or a stray merge). A commit is foreign when its message
+  # references a Rally id but never the expected one — the --story id when
+  # given, otherwise the id from the commit's own PR branch name. Excluded
+  # unless --keep-foreign-commits.
+  if [[ ${#COMMITS[@]} -gt 0 ]]; then
     STORY_UP=$(echo "$STORY" | tr '[:lower:]' '[:upper:]')
     FOREIGN=()
     KEEP=()
-    for h in "${COMMITS[@]}"; do
+    for idx in "${!COMMITS[@]}"; do
+      h="${COMMITS[$idx]}"
+      EXPECT="${STORY_UP:-${EXPECTED[$idx]}}"
+      if [[ -z "$EXPECT" ]]; then
+        KEEP+=("$h")   # no story context to compare against
+        continue
+      fi
       IDS=$(git show -s --format=%B "$h" \
               | grep -ioE '(US|DE|TA|TS)[0-9]{4,}' | tr '[:lower:]' '[:upper:]' \
               | sort -u || true)
-      if [[ -n "$IDS" ]] && ! grep -qx "$STORY_UP" <<< "$IDS"; then
+      if [[ -n "$IDS" ]] && ! grep -qx "$EXPECT" <<< "$IDS"; then
         FOREIGN+=("$h")
       else
         KEEP+=("$h")
@@ -285,7 +301,7 @@ if ! $CONTINUE_RUN; then
       else
         echo "WARNING: excluding ${#FOREIGN[@]} commit(s) that reference a different story id:" >&2
         for h in "${FOREIGN[@]}"; do git show -s --format='    %h %s' "$h" >&2; done
-        echo "         Re-run with --keep-foreign-commits if they really belong to $STORY." >&2
+        echo "         Re-run with --keep-foreign-commits if they really belong here." >&2
         COMMITS=("${KEEP[@]:+${KEEP[@]}}")
       fi
     fi
