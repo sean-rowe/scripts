@@ -202,13 +202,13 @@ if ! $CONTINUE_RUN; then
   # --- Fetch PR details and order by merge time (unmerged last) --------------
   info "Fetching PR details..."
   PR_JSON=$(for n in "${PRS[@]}"; do
-    gh pr view "$n" --json number,title,state,mergedAt,headRefName,commits \
+    gh pr view "$n" --json number,title,state,mergedAt,headRefName,commits,url \
       || die "Cannot read PR #$n (does it exist in this repo?)"
   done | jq -s 'unique_by(.number) | sort_by(.mergedAt // "9999-99-99", .number)')
 
   echo ""
   echo "PRs to promote into $TO_BRANCH (in this order):"
-  echo "$PR_JSON" | jq -r '.[] | "  #\(.number) [\(.state)] \(.title)  (\(.commits | length) commit(s), branch: \(.headRefName))"'
+  echo "$PR_JSON" | jq -r '.[] | "  #\(.number) [\(.state)] \(.title)  (\(.commits | length) commit(s), branch: \(.headRefName))\n      \(.url)"'
   echo ""
 
   OPEN_COUNT=$(echo "$PR_JSON" | jq '[.[] | select(.state != "MERGED")] | length')
