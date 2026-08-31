@@ -9,9 +9,12 @@
 # or commits reference the id).
 #
 # Usage:
-#   promote-pr.sh --to-release 45 --pr 123 [--pr 456 ...]
-#   promote-pr.sh --to-release 45 --pr 123,456
-#   promote-pr.sh --to-release 45 --story US833008
+#   promote-pr.sh --to 45 --pr 123 [--pr 456 ...]
+#   promote-pr.sh --to release-45 --pr 123,456
+#   promote-pr.sh --to main --story US833008
+#
+# The target (--to) accepts "main", "release-45", a bare number (45 ->
+# release-45), or any other branch name verbatim.
 #
 # What it does:
 #   1. Resolves the PR list (explicit --pr, or find-rally-prs.sh <story>)
@@ -20,9 +23,12 @@
 #      commits from GitHub (via refs/pull/N/head, so this works even after
 #      squash-merges and deleted branches) and collects the hashes
 #      oldest-first, deduped, skipping merge commits and commits already on
-#      the target release branch
-#   3. Creates a branch off the target release branch, cherry-picks the
-#      commits onto it, pushes, and opens a PR into the release branch
+#      the target branch
+#   3. Creates a branch off the target branch (named
+#      <source-branch>-to-<target> for a single PR, promote/<story>-<target>
+#      otherwise), cherry-picks the commits onto it, pushes, opens a PR into
+#      the target — for a single PR the new PR reuses the original title
+#      (release numbers rewritten) and body — and opens it in the browser
 #
 # If a cherry-pick hits a conflict the run stops with progress saved.
 # Edit the conflicted files to resolve them, then:
@@ -32,11 +38,13 @@
 # Options:
 #   --pr <n[,n...]>       PR number(s) to promote (repeatable)
 #   --story <id>          Rally story/defect id -> PRs via find-rally-prs.sh
-#   --to-release <n>      Target release number (required)
+#   --to <target>         Target branch: main | release-45 | 45 (required)
+#   --to-release <n>      Alias for --to
 #   --remote <name>       Git remote (default: origin)
 #   --release-prefix <p>  Release branch prefix (default: release-)
 #   --branch-name <name>  Override the generated work branch name
 #   --no-pr               Skip opening the pull request
+#   --no-open             Don't open the created PR in the browser
 #   --yes                 Skip confirmation of the resolved PR list
 #   --dry-run             Show what would happen without changing anything
 #   --continue            Resume an interrupted run after fixing conflicts
@@ -48,11 +56,12 @@ set -euo pipefail
 
 PRS=()
 STORY=""
-TO_RELEASE=""
+TARGET_SPEC=""
 REMOTE="origin"
 RELEASE_PREFIX="release-"
 BRANCH_OVERRIDE=""
 CREATE_PR=true
+OPEN_PR=true
 ASSUME_YES=false
 DRY_RUN=false
 CONTINUE_RUN=false
@@ -74,11 +83,12 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --pr)             IFS=',' read -ra _prs <<< "${2:-}"; PRS+=("${_prs[@]}"); shift 2 ;;
     --story)          STORY="${2:-}"; shift 2 ;;
-    --to-release)     TO_RELEASE="${2:-}"; shift 2 ;;
+    --to|--to-release) TARGET_SPEC="${2:-}"; shift 2 ;;
     --remote)         REMOTE="${2:-}"; shift 2 ;;
     --release-prefix) RELEASE_PREFIX="${2:-}"; shift 2 ;;
     --branch-name)    BRANCH_OVERRIDE="${2:-}"; shift 2 ;;
     --no-pr)          CREATE_PR=false; shift ;;
+    --no-open)        OPEN_PR=false; shift ;;
     --yes)            ASSUME_YES=true; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
     --continue)       CONTINUE_RUN=true; shift ;;
@@ -100,10 +110,11 @@ command -v jq >/dev/null 2>&1 || die "jq not found. Install with: brew install j
 save_state() {
   cat > "$STATE_FILE" <<EOF
 STORY='$STORY'
-TO_RELEASE='$TO_RELEASE'
+TO_BRANCH='$TO_BRANCH'
 REMOTE='$REMOTE'
 RELEASE_PREFIX='$RELEASE_PREFIX'
 CREATE_PR=$CREATE_PR
+OPEN_PR=$OPEN_PR
 PR_LIST='${PRS[*]}'
 NEW_BRANCH='$NEW_BRANCH'
 FORCE_PUSH=$FORCE_PUSH
@@ -124,7 +135,7 @@ if $ABORT_RUN; then
     elif git rev-parse --verify --quiet refs/heads/master >/dev/null; then
       git switch -q master
     else
-      git switch -q --detach "${REMOTE}/${RELEASE_PREFIX}${TO_RELEASE}"
+      git switch -q --detach "${REMOTE}/${TO_BRANCH}"
     fi
   fi
   git branch -D "$NEW_BRANCH" >/dev/null 2>&1 || true
@@ -145,16 +156,21 @@ if $CONTINUE_RUN; then
   # shellcheck disable=SC2206
   PRS=($PR_LIST)
   START_INDEX=$NEXT_INDEX
-  info "Resuming onto ${RELEASE_PREFIX}${TO_RELEASE} (commit $NEXT_INDEX of ${#COMMITS[@]} was in progress)"
+  info "Resuming onto ${TO_BRANCH} (commit $NEXT_INDEX of ${#COMMITS[@]} was in progress)"
 else
-  [[ -n "$TO_RELEASE" ]] || die "--to-release is required"
+  [[ -n "$TARGET_SPEC" ]] || die "--to is required (main, release-45, or 45)"
   [[ ${#PRS[@]} -gt 0 || -n "$STORY" ]] || die "Give --pr <n> (repeatable) or --story <id>"
   if [[ -f "$STATE_FILE" ]] && ! $DRY_RUN; then
     die "An interrupted run exists. Re-run with --continue to resume it, or --abort to discard it."
   fi
-fi
 
-TO_BRANCH="${RELEASE_PREFIX}${TO_RELEASE}"
+  # Resolve the target: main | release-45 | bare number | any branch name
+  if [[ "$TARGET_SPEC" =~ ^[0-9]+$ ]]; then
+    TO_BRANCH="${RELEASE_PREFIX}${TARGET_SPEC}"
+  else
+    TO_BRANCH="$TARGET_SPEC"
+  fi
+fi
 
 if ! $CONTINUE_RUN; then
   if [[ -n "$(git status --porcelain)" ]]; then
@@ -245,9 +261,13 @@ if ! $CONTINUE_RUN; then
     git show -s --format='    %h %s' "$h"
   done
 
-  # --- Work branch off the target release ------------------------------------
+  # --- Work branch off the target ---------------------------------------------
+  # Single PR keeps the promote-pr convention: <source-branch>-to-<target>.
   if [[ -n "$BRANCH_OVERRIDE" ]]; then
     NEW_BRANCH="$BRANCH_OVERRIDE"
+  elif [[ ${#PRS[@]} -eq 1 && -z "$STORY" ]]; then
+    SRC=$(echo "$PR_JSON" | jq -r '.[0].headRefName')
+    NEW_BRANCH="${SRC}-to-${TO_BRANCH}"
   elif [[ -n "$STORY" ]]; then
     NEW_BRANCH="promote/${STORY}-${TO_BRANCH}"
   else
@@ -375,17 +395,37 @@ PUSH_OUTPUT=$(git push "${PUSH_ARGS[@]}" "$REMOTE" "$NEW_BRANCH" 2>&1) \
 # --- Create the pull request -------------------------------------------------
 PR_URL=""
 if $CREATE_PR; then
-  if [[ -n "$STORY" ]]; then
-    PR_TITLE="$STORY: promote to $TO_BRANCH"
-  else
-    PR_TITLE="Promote PR(s) ${PRS[*]} to $TO_BRANCH"
+  # Single PR: reuse the original title (release numbers rewritten to the
+  # target) and body, like promote-pr. Multi/story: composed title.
+  PR_TITLE=""
+  ORIG_BODY=""
+  if [[ ${#PRS[@]} -eq 1 ]]; then
+    PR_TITLE=$(gh pr view "${PRS[0]}" --json title --jq '.title' 2>/dev/null) || PR_TITLE=""
+    ORIG_BODY=$(gh pr view "${PRS[0]}" --json body --jq '.body' 2>/dev/null) || ORIG_BODY=""
+    if [[ -n "$PR_TITLE" && "$TO_BRANCH" =~ ^${RELEASE_PREFIX}[0-9]+$ ]]; then
+      PR_TITLE=$(echo "$PR_TITLE" | sed -E "s/${RELEASE_PREFIX}[0-9]+/${TO_BRANCH}/g")
+    fi
   fi
-  PR_BODY="Automated promotion of $TOTAL commit(s) from PR(s) ${PRS[*]} onto '$TO_BRANCH'."
+  if [[ -z "$PR_TITLE" ]]; then
+    if [[ -n "$STORY" ]]; then
+      PR_TITLE="$STORY: promote to $TO_BRANCH"
+    else
+      PR_TITLE="Promote PR(s) ${PRS[*]} to $TO_BRANCH"
+    fi
+  fi
+  PR_BODY="${ORIG_BODY}${ORIG_BODY:+
+
+}---
+Cherry-picked $TOTAL commit(s) from PR(s) ${PRS[*]} onto ${TO_BRANCH} by $SCRIPT_NAME."
   info "Creating pull request via gh..."
   PR_URL=$(gh pr create --base "$TO_BRANCH" --head "$NEW_BRANCH" \
              --title "$PR_TITLE" --body "$PR_BODY" 2>&1 \
            | grep -Eo 'https?://[^[:space:]]+' | tail -1) || PR_URL=""
   [[ -n "$PR_URL" ]] || echo "WARNING: 'gh pr create' failed; create the PR manually." >&2
+  if [[ -n "$PR_URL" ]] && $OPEN_PR && command -v open >/dev/null 2>&1; then
+    info "Opening PR in browser..."
+    open "$PR_URL" 2>/dev/null || true
+  fi
 fi
 
 rm -f "$STATE_FILE"
