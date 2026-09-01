@@ -58,17 +58,48 @@ user = ""
 app_password = ""
 
 [ai]
-# Use the `claude` CLI to score each acceptance criterion against the story
-# branch's diff (0-100%). Slower and uses tokens; without it the script
-# applies a story-level heuristic (task ToDo %, PR/branch state) instead.
+# Use the `claude` CLI for the judgment layers: per-AC completion % against
+# the branch diff, whether each AC is tested behaviorally, test style,
+# coverage adequacy, architecture notes, and the per-dev coaching
+# scorecards. Slower and uses tokens; without it the report still runs with
+# a story-level heuristic and no coaching section.
 enabled = false
 max_diff_chars = 12000
+coaching = true          # per-dev scorecards (needs enabled = true)
 
 [risks]
 stale_pr_days = 3        # open PR untouched this many days -> risk
 max_pr_comments = 10     # PR with more comments than this -> churn risk
 no_branch_after_pct = 50 # no branch when sprint is this % elapsed -> risk
 stale_story_days = 3     # In-Progress story untouched this many days -> risk
+review_wait_days = 1     # open PR unreviewed this many days -> agenda item
+blocked_escalate_days = 3    # blocked this long -> SM escalation
+acceptance_wait_days = 2     # Completed this long -> PO agenda item
+big_pr_lines = 400       # added+deleted lines above this -> oversized PR
+yellow_gap_pct = 10      # completion% this far behind sprint elapsed% -> yellow
+red_gap_pct = 30         # ... this far behind -> red
+
+[targets]
+# Branches checked in the promotion matrix per story. {n} is the current
+# sprint number, {prev} is n-1.
+branches = ["develop", "release-{prev}", "release-{n}", "qa", "qa1"]
+
+[sources]
+# Sqlite databases holding transcripts / chats / emails. Schema-agnostic:
+# tables and text columns are discovered automatically and searched for
+# story ids and dev names. Leave empty to skip the comms sections.
+sqlite = [
+  # "~/data/transcripts.db",
+  # "~/data/slack-export.db",
+]
+# Markdown checklist for standing action items ('- [ ] item' = open).
+# Relative paths resolve against this config file's directory.
+action_items = ""        # e.g. "reports/action-items.md"
+max_snippets_per_dev = 6
+
+[capacity]
+# Devs out today (names exactly as in [pod].devs); mutes their agenda items.
+out = []
 
 [report]
 output_dir = "reports"                 # HTML reports land here, one per day

@@ -2,24 +2,38 @@
 #
 # pod-audit.py
 #
-# Daily progress audit for a pod. For every dev named in the config it pulls
-# their Rally stories for the current sprint (computed from a config anchor
-# date; sprints are length_days long) and the previous N sprints, then for
-# each story reports:
+# Daily morning report for pod leadership (tech lead / PM / PO / scrum
+# master — not the devs). For every dev in the config it pulls their Rally
+# stories for the current sprint (computed from a config anchor date) and
+# the previous N sprints, cross-references git branches and PRs, and builds
+# an HTML + PDF report containing:
 #
-#   - acceptance criteria, with a completion % per AC (scored by the `claude`
-#     CLI against the story branch's diff when [ai].enabled, otherwise a
-#     story-level heuristic from task ToDo hours / PR / branch state)
-#   - the story branch, found by searching configured repos for the story id,
-#     with commit count, files changed, and last-commit age
-#   - pull requests raised from that branch (GitHub via `gh`, Bitbucket via
-#     its REST API): state, review decision, comment count, age
-#   - blockers and detected risks (blocked flag, no estimate, no branch late
-#     in the sprint, stale PRs/stories, comment churn, spillover from earlier
-#     sprints, ToDo not moving since the last run)
+#   - what changed since the last report, and a "conversations to have
+#     today" agenda routed to the right owner (TL / PO / SM)
+#   - a pod summary with green/yellow/red lateness per story, and a
+#     promotion matrix per story across [targets].branches
+#     (develop / release-N / qa / ...): merged, PR open, or missing
+#   - reviews & CI: PRs waiting on first review (and on whom), failing and
+#     pending checks, oversized PRs, review-load distribution
+#   - blocked stories with age, the PO acceptance queue with age, scope
+#     added after sprint start, WIP-limit breaches, data-hygiene problems
+#   - burndown charts (reconstructed from Rally AcceptedDate) for the pod
+#     and per dev, for the current and previous sprints
+#   - per story: acceptance criteria with completion % each and whether
+#     each is tested behaviorally, test style (behavioral vs
+#     implementation), coverage adequacy, and an architecture note — all
+#     judged by the `claude` CLI against the branch diff when [ai].enabled,
+#     with a task/PR-based heuristic otherwise
+#   - per dev: a coaching scorecard (delivery/quality/communication/
+#     collaboration, early at-risk flag, strengths, suggestions),
+#     outstanding questions/requests mined from configured sqlite
+#     transcript/chat/email databases, and their recent mentions
+#   - open action items from a configured markdown checklist
 #
-# Each run appends a snapshot of remaining points to a history file; those
-# snapshots drive a pod burndown chart and one per dev in the HTML report.
+# Every optional source degrades gracefully: an unconfigured section
+# reports itself as such instead of failing the run. Each run snapshots
+# state into a history file, which powers the aging, churn, and
+# no-movement detections and keeps coaching scores stable day to day.
 # A PDF copy of the report is produced alongside the HTML (rendered with a
 # headless Chromium-based browser so it keeps the exact same look).
 #
@@ -57,6 +71,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -90,7 +105,7 @@ def warn(msg):
 # --------------------------------------------------------------------------
 
 DEFAULTS = {
-    "pod": {"name": "Pod", "devs": []},
+    "pod": {"name": "Pod", "devs": [], "wip_limit": 2},
     "sprint": {"length_days": 14, "previous": 2},
     "rally": {
         "server": "https://rally1.rallydev.com",
@@ -102,13 +117,28 @@ DEFAULTS = {
     },
     "git": {"repos": [], "remote": "origin"},
     "bitbucket": {"token": "", "user": "", "app_password": ""},
-    "ai": {"enabled": False, "max_diff_chars": 12000},
+    "ai": {"enabled": False, "max_diff_chars": 12000, "coaching": True},
     "risks": {
         "stale_pr_days": 3,
         "max_pr_comments": 10,
         "no_branch_after_pct": 50,
         "stale_story_days": 3,
+        "review_wait_days": 1,
+        "blocked_escalate_days": 3,
+        "acceptance_wait_days": 2,
+        "big_pr_lines": 400,
+        "yellow_gap_pct": 10,
+        "red_gap_pct": 30,
     },
+    # Promotion targets checked per story; {n} = current sprint, {prev} = n-1.
+    "targets": {"branches": ["develop", "release-{prev}", "release-{n}", "qa", "qa1"]},
+    # Optional extra data sources; sections degrade gracefully when empty.
+    "sources": {
+        "sqlite": [],                    # transcript/chat/email DBs to search
+        "action_items": "",              # markdown checklist file ('- [ ] item')
+        "max_snippets_per_dev": 6,
+    },
+    "capacity": {"out": []},             # devs out today (names as in [pod].devs)
     "report": {"output_dir": "reports", "history_file": "reports/history.json", "pdf": True},
 }
 
@@ -207,7 +237,7 @@ def iteration_name(cfg, n):
 STORY_FETCH = (
     "FormattedID,Name,ObjectID,ScheduleState,PlanEstimate,ToDo,"
     "TaskEstimateTotal,TaskRemainingTotal,Blocked,BlockedReason,Description,"
-    "Discussion,LastUpdateDate,AcceptedDate,Iteration,Owner,DisplayName"
+    "Discussion,LastUpdateDate,AcceptedDate,InProgressDate,Iteration,Owner,DisplayName"
 )
 
 
@@ -343,6 +373,17 @@ class PR:
     draft: bool
     created: str
     updated: str
+    base: str = ""                       # branch the PR targets
+    author: str = ""
+    merged: str = ""                     # date merged, "" if not
+    additions: int = 0
+    deletions: int = 0
+    files: int = 0
+    checks_total: int = 0
+    checks_failed: int = 0
+    checks_pending: int = 0
+    reviewers: list = field(default_factory=list)   # people who reviewed
+    awaiting: list = field(default_factory=list)    # requested, not yet reviewed
 
 
 @dataclass
@@ -373,10 +414,18 @@ class Story:
     discussions: int
     last_update: dt.date | None
     accepted: dt.date | None
+    in_progress: dt.date | None
     acs: list
     ac_scores: list = field(default_factory=list)   # [(percent, note)] per AC
     branches: list = field(default_factory=list)
     risks: list = field(default_factory=list)
+    # AI analysis (filled when [ai].enabled)
+    ac_tested: list = field(default_factory=list)   # bool per AC: tested behaviorally
+    tests_style: str = ""       # behavioral / implementation / mixed / none
+    coverage_note: str = ""
+    arch_note: str = ""
+    ai_concerns: list = field(default_factory=list)
+    lateness: str = ""          # green / yellow / red
 
     @property
     def done(self):
@@ -423,6 +472,7 @@ def build_story(rally, kind, raw):
         discussions=disc.get("Count", 0) if isinstance(disc, dict) else 0,
         last_update=_rally_date(raw.get("LastUpdateDate")),
         accepted=_rally_date(raw.get("AcceptedDate")),
+        in_progress=_rally_date(raw.get("InProgressDate")),
         acs=parse_acceptance_criteria(raw, rally.ac_field),
     )
 
@@ -548,7 +598,9 @@ def github_prs(repo_path, branch):
             continue
         rc, detail, _ = run(
             ["gh", "pr", "view", str(number), "--json",
-             "title,state,url,isDraft,createdAt,updatedAt,reviewDecision,comments,reviews"],
+             "title,state,url,isDraft,createdAt,updatedAt,reviewDecision,comments,"
+             "reviews,baseRefName,author,mergedAt,additions,deletions,changedFiles,"
+             "statusCheckRollup,reviewRequests"],
             cwd=repo_path,
         )
         if rc != 0:
@@ -557,9 +609,32 @@ def github_prs(repo_path, branch):
             d = json.loads(detail)
         except json.JSONDecodeError:
             continue
+        reviews = d.get("reviews") or []
         comments = len(d.get("comments") or []) + len(
-            [r for r in d.get("reviews") or [] if (r.get("body") or "").strip()]
+            [r for r in reviews if (r.get("body") or "").strip()]
         )
+        reviewers = []
+        for r in reviews:
+            login = ((r.get("author") or {}).get("login") or "").strip()
+            if login and login not in reviewers:
+                reviewers.append(login)
+        awaiting = []
+        for rr in d.get("reviewRequests") or []:
+            who = rr.get("login") or rr.get("slug") or rr.get("name") or ""
+            if who and who not in awaiting:
+                awaiting.append(who)
+        ok_states = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+        bad_states = {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+        total = failed = pending = 0
+        for c in d.get("statusCheckRollup") or []:
+            if not isinstance(c, dict):
+                continue
+            total += 1
+            val = (c.get("conclusion") or c.get("state") or "").upper()
+            if val in bad_states:
+                failed += 1
+            elif val not in ok_states:
+                pending += 1
         prs.append(PR(
             title=d.get("title", ""),
             state=d.get("state", ""),
@@ -569,6 +644,17 @@ def github_prs(repo_path, branch):
             draft=bool(d.get("isDraft")),
             created=(d.get("createdAt") or "")[:10],
             updated=(d.get("updatedAt") or "")[:10],
+            base=d.get("baseRefName") or "",
+            author=((d.get("author") or {}).get("login") or ""),
+            merged=(d.get("mergedAt") or "")[:10],
+            additions=d.get("additions") or 0,
+            deletions=d.get("deletions") or 0,
+            files=d.get("changedFiles") or 0,
+            checks_total=total,
+            checks_failed=failed,
+            checks_pending=pending,
+            reviewers=reviewers,
+            awaiting=awaiting,
         ))
     return prs
 
@@ -608,7 +694,17 @@ def bitbucket_prs(cfg, remote_url, branch):
                 urllib.request.Request(detail_url, headers=headers), timeout=30
             ) as resp:
                 d = json.load(resp)
-            approvals = sum(1 for p in d.get("participants", []) if p.get("approved"))
+            participants = d.get("participants", [])
+            approvals = sum(1 for p in participants if p.get("approved"))
+            reviewers = [
+                ((p.get("user") or {}).get("display_name") or "")
+                for p in participants if p.get("approved")
+            ]
+            awaiting = [
+                ((p.get("user") or {}).get("display_name") or "")
+                for p in participants
+                if p.get("role") == "REVIEWER" and not p.get("approved")
+            ]
             prs.append(PR(
                 title=d.get("title", ""),
                 state=d.get("state", ""),
@@ -618,6 +714,11 @@ def bitbucket_prs(cfg, remote_url, branch):
                 draft=bool(d.get("draft")),
                 created=(d.get("created_on") or "")[:10],
                 updated=(d.get("updated_on") or "")[:10],
+                base=((d.get("destination") or {}).get("branch") or {}).get("name", ""),
+                author=((d.get("author") or {}).get("display_name") or ""),
+                merged=(d.get("updated_on") or "")[:10] if d.get("state") == "MERGED" else "",
+                reviewers=[r for r in reviewers if r],
+                awaiting=[a for a in awaiting if a],
             ))
     except (urllib.error.URLError, TimeoutError, OSError,
             json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
@@ -657,43 +758,102 @@ def heuristic_percent(story):
     return 0
 
 
-def ai_score_acs(story, diff_text, cfg):
-    """Ask the claude CLI to score each AC against the branch diff. Returns
-    [(percent, note)] aligned with story.acs, or None on any failure."""
+def _ai_json(prompt, label, timeout=300):
+    """Run `claude -p` and extract the first JSON object/array from the reply."""
+    rc, out, err = run(["claude", "-p"], input_=prompt, timeout=timeout)
+    if rc != 0:
+        warn(f"claude CLI failed for {label}: {err.splitlines()[0] if err else rc}")
+        return None
+    m = re.search(r"\{.*\}|\[.*\]", out, re.DOTALL)
+    if not m:
+        warn(f"claude returned no JSON for {label}")
+        return None
+    try:
+        return json.loads(m.group(0))
+    except ValueError:
+        warn(f"claude returned unparseable JSON for {label}")
+        return None
+
+
+def ai_story_analysis(story, diff_text, cfg):
+    """One claude pass per story: per-AC coded %, whether each AC is tested
+    behaviorally, test style, coverage adequacy, and an architecture note.
+    Fills the story's AI fields in place; silently leaves heuristics on failure."""
     ac_list = "\n".join(f"{i + 1}. {ac}" for i, ac in enumerate(story.acs))
-    prompt = f"""You are auditing progress on a user story. Based ONLY on the code diff below, estimate how complete each acceptance criterion is (0-100) with a short note (max 12 words) explaining the evidence.
+    prompt = f"""You are a tech lead auditing progress on a story. Judge ONLY from the code diff below.
 
 Story: {story.sid} — {story.name}
 
 Acceptance criteria:
 {ac_list}
 
-Code diff of the story branch vs the mainline:
+Code diff of the story branch vs the mainline (includes test changes):
 ```
 {diff_text}
 ```
 
-Respond with ONLY a JSON array, one object per criterion in order:
-[{{"index": 1, "percent": 0, "note": "..."}}, ...]"""
-    rc, out, err = run(["claude", "-p"], input_=prompt, timeout=240)
-    if rc != 0:
-        warn(f"claude CLI failed for {story.sid}: {err.splitlines()[0] if err else rc}")
-        return None
-    m = re.search(r"\[.*\]", out, re.DOTALL)
-    if not m:
-        return None
+Respond with ONLY this JSON object:
+{{
+ "acs": [{{"index": 1, "percent": 0-100, "note": "evidence, max 12 words", "tested_behaviorally": true/false}}, ...],
+ "tests_style": "behavioral" | "implementation" | "mixed" | "none",
+ "coverage_adequate": "yes" | "no" | "partial",
+ "coverage_note": "max 20 words",
+ "architecture": "how the changes look architecturally, max 40 words; name concrete issues",
+ "concerns": ["specific risk or smell, max 15 words each"]
+}}
+"tested_behaviorally" means a test exercises the AC through observable behavior (inputs/outputs, API, UI), not internals/mocks of the unit under test."""
+    data = _ai_json(prompt, story.sid)
+    if not isinstance(data, dict):
+        return
     try:
-        items = json.loads(m.group(0))
-        scores = {int(i["index"]): i for i in items}
-        return [
-            (
-                max(0, min(100, int(scores.get(i + 1, {}).get("percent", 0)))),
-                str(scores.get(i + 1, {}).get("note", "")),
-            )
+        scores = {int(i["index"]): i for i in data.get("acs") or [] if isinstance(i, dict)}
+        story.ac_scores = [
+            (max(0, min(100, int(scores.get(i + 1, {}).get("percent", 0)))),
+             str(scores.get(i + 1, {}).get("note", "")))
+            for i in range(len(story.acs))
+        ]
+        story.ac_tested = [
+            bool(scores.get(i + 1, {}).get("tested_behaviorally", False))
             for i in range(len(story.acs))
         ]
     except (ValueError, KeyError, TypeError):
+        pass
+    story.tests_style = str(data.get("tests_style") or "")
+    cov = str(data.get("coverage_adequate") or "")
+    note = str(data.get("coverage_note") or "")
+    story.coverage_note = f"{cov}{' — ' + note if note else ''}" if cov else ""
+    story.arch_note = str(data.get("architecture") or "")
+    story.ai_concerns = [str(c) for c in data.get("concerns") or [] if str(c).strip()][:5]
+
+
+def ai_dev_coaching(dev, facts, prev_card, cfg):
+    """One claude pass per dev: scorecard, strengths, coaching, early risk
+    call. prev_card (yesterday's) is included so scores stay stable unless
+    the evidence moves. Returns the scorecard dict or None."""
+    prev = json.dumps(prev_card, indent=1) if prev_card else "none (first run)"
+    prompt = f"""You are coaching-notes assistant for a tech lead. This report is read by leadership only, never by the dev. Be direct and specific; praise what is genuinely good.
+
+Developer: {dev}
+
+Today's facts (stories, progress, PRs, reviews given, recent communications):
+{json.dumps(facts, indent=1, default=str)}
+
+Yesterday's scorecard (keep scores stable unless today's evidence justifies a change):
+{prev}
+
+Respond with ONLY this JSON object:
+{{
+ "scores": {{"delivery": 1-5, "quality": 1-5, "communication": 1-5, "collaboration": 1-5}},
+ "strengths": ["what they are getting right, specific, max 20 words each"],
+ "coaching": ["concrete suggestion the tech lead could raise, max 25 words each"],
+ "risk": "none" | "watch" | "action",
+ "risk_reason": "if watch/action: why they may not finish in time, max 30 words",
+ "questions_requests": ["outstanding question or request FROM this dev found in the communications, max 20 words each"]
+}}"""
+    data = _ai_json(prompt, f"coaching:{dev}")
+    if not isinstance(data, dict) or not isinstance(data.get("scores"), dict):
         return None
+    return data
 
 
 # --------------------------------------------------------------------------
@@ -752,6 +912,303 @@ def assess_risks(story, sprint_n, current_sprint, elapsed_pct, cfg, prev_story_s
 
 
 # --------------------------------------------------------------------------
+# Leadership analysis: promotion matrix, lateness, reviews, aging, agenda
+# --------------------------------------------------------------------------
+
+def resolve_targets(cfg, current_sprint):
+    out = []
+    for t in cfg["targets"]["branches"]:
+        try:
+            out.append(t.format(n=current_sprint, prev=current_sprint - 1))
+        except (KeyError, IndexError, ValueError):
+            warn(f"Bad [targets].branches entry {t!r}; skipping")
+    return out
+
+
+def promotion_matrix(story, targets):
+    """{target: 'merged'|'open'|'declined'|'-'} judged from the story's PRs."""
+    row = {}
+    for t in targets:
+        status = "-"
+        for pr in story.all_prs:
+            if pr.base != t:
+                continue
+            if pr.state == "MERGED":
+                status = "merged"
+                break
+            if pr.state == "OPEN" and status == "-":
+                status = "open"
+            elif pr.state in ("DECLINED", "CLOSED") and status == "-":
+                status = "declined"
+        row[t] = status
+    return row
+
+
+def score_lateness(story, sprint_n, current_sprint, elapsed_pct, cfg):
+    r = cfg["risks"]
+    if story.done:
+        story.lateness = "green"
+    elif sprint_n < current_sprint:
+        story.lateness = "red"          # spillover is late by definition
+    else:
+        gap = elapsed_pct - story.completion
+        if gap >= r["red_gap_pct"]:
+            story.lateness = "red"
+        elif gap >= r["yellow_gap_pct"]:
+            story.lateness = "yellow"
+        else:
+            story.lateness = "green"
+    return story.lateness
+
+
+def review_stats(all_stories, today, cfg):
+    """(waiting, load): open PRs awaiting review with wait days, and how many
+    reviews each person has given across the pod's PRs."""
+    waiting = []
+    load = {}
+    seen = set()
+    for s in all_stories:
+        for pr in s.all_prs:
+            if pr.url in seen:
+                continue
+            seen.add(pr.url)
+            for who in pr.reviewers:
+                load[who] = load.get(who, 0) + 1
+            if pr.state == "OPEN" and not pr.draft and not pr.reviewers:
+                try:
+                    wait = (today - dt.date.fromisoformat(pr.created)).days
+                except ValueError:
+                    wait = 0
+                waiting.append((s, pr, wait))
+    waiting.sort(key=lambda x: -x[2])
+    return waiting, load
+
+
+def first_snapshot_date(history, sid, pred, before=None):
+    """Earliest snapshot date whose per-story record satisfies pred."""
+    for date_str, snap in sorted(history["snapshots"].items()):
+        if before and date_str >= before:
+            break
+        rec = (snap.get("stories") or {}).get(sid)
+        if isinstance(rec, dict) and pred(rec):
+            try:
+                return dt.date.fromisoformat(date_str)
+            except ValueError:
+                continue
+    return None
+
+
+def aging_queues(all_stories, history, today, cfg):
+    """(blocked_aging, acceptance_queue) with day counts from history."""
+    r = cfg["risks"]
+    blocked, accept = [], []
+    for s in all_stories:
+        if s.blocked:
+            since = first_snapshot_date(history, s.sid, lambda rec: rec.get("blocked"))
+            days = (today - since).days if since else 0
+            blocked.append((s, days))
+        if s.state == "Completed":
+            since = first_snapshot_date(history, s.sid, lambda rec: rec.get("state") == "Completed")
+            days = (today - since).days if since else 0
+            accept.append((s, days))
+    blocked.sort(key=lambda x: -x[1])
+    accept.sort(key=lambda x: -x[1])
+    return blocked, accept
+
+
+def scope_churn(history, current_sprint, per_dev_current, today):
+    """Stories/points added after the sprint's first recorded day."""
+    baseline_date = None
+    baseline = {}
+    for date_str, snap in sorted(history["snapshots"].items()):
+        if snap.get("sprint") == current_sprint and snap.get("stories"):
+            baseline_date = date_str
+            baseline = snap["stories"]
+            break
+    # No baseline before today = first meaningful run; nothing to compare.
+    if baseline_date is None or baseline_date >= today.isoformat():
+        return None
+    added = []
+    for stories in per_dev_current.values():
+        for s in stories:
+            if s.sid not in baseline:
+                added.append(s)
+    base_points = sum((rec.get("points") or 0) for rec in baseline.values()
+                     if isinstance(rec, dict))
+    return {"baseline_date": baseline_date, "added": added, "base_points": base_points}
+
+
+def yesterday_digest(history, all_stories, today):
+    """What changed since the previous snapshot: state moves and PR activity."""
+    prev = None
+    for date_str, snap in sorted(history["snapshots"].items(), reverse=True):
+        if date_str < today.isoformat():
+            prev = snap
+            break
+    events = []
+    prev_stories = (prev or {}).get("stories") or {}
+    for s in all_stories:
+        old = prev_stories.get(s.sid) or {}
+        old_state = old.get("state")
+        if old_state and old_state != s.state:
+            events.append(f"{s.sid} moved {old_state} -> {s.state}")
+        elif not old_state and prev is not None:
+            events.append(f"{s.sid} appeared ({s.state})")
+    cutoff = (today - dt.timedelta(days=3)).isoformat()
+    for s in all_stories:
+        for pr in s.all_prs:
+            if pr.merged and pr.merged >= cutoff:
+                events.append(f"PR merged into {pr.base}: {s.sid} — {pr.title}")
+            elif pr.state == "OPEN" and pr.created >= cutoff:
+                events.append(f"PR opened against {pr.base}: {s.sid} — {pr.title}")
+    return events
+
+
+def wip_and_hygiene(per_dev, current_sprint, cfg):
+    """(wip_flags, hygiene): WIP-limit breaches and data-quality problems."""
+    wip_flags = []
+    hygiene = []
+    for dev, by_sprint in per_dev.items():
+        active = [s for sp in by_sprint.values() for s in sp if s.state == "In-Progress"]
+        if len(active) > cfg["pod"]["wip_limit"]:
+            wip_flags.append((dev, active))
+        for sp_n, stories in by_sprint.items():
+            for s in stories:
+                if s.points is None:
+                    hygiene.append((dev, s, "no point estimate"))
+                if not s.acs:
+                    hygiene.append((dev, s, "no acceptance criteria"))
+                if s.state == "In-Progress" and not s.branches:
+                    hygiene.append((dev, s, "In-Progress but no branch found"))
+    return wip_flags, hygiene
+
+
+def build_agenda(per_dev, blocked_aging, accept_queue, waiting_reviews, wip_flags, cfg, out_today):
+    """The 'conversations to have today' list: (owner, text)."""
+    r = cfg["risks"]
+    agenda = []
+    for s, days in blocked_aging:
+        if days >= r["blocked_escalate_days"]:
+            agenda.append(("Scrum master",
+                           f"Escalate {s.sid} — blocked {days}d: {s.blocked_reason or 'no reason recorded'}"))
+    for s, days in accept_queue:
+        if days >= r["acceptance_wait_days"]:
+            agenda.append(("PO", f"Accept or bounce {s.sid} — sitting Completed for {days}d"))
+    for s, pr, wait in waiting_reviews:
+        if wait >= r["review_wait_days"]:
+            who = ", ".join(pr.awaiting) or "no reviewer assigned"
+            agenda.append(("Tech lead", f"Get {s.sid} reviewed — PR open {wait}d ({who}): {pr.url}"))
+    for dev, by_sprint in per_dev.items():
+        if dev in out_today:
+            continue
+        reds = [s for sp in by_sprint.values() for s in sp if s.lateness == "red" and not s.done]
+        if reds:
+            ids = ", ".join(s.sid for s in reds)
+            agenda.append(("Tech lead", f"Talk to {dev} — red: {ids}"))
+    for dev, active in wip_flags:
+        agenda.append(("Scrum master",
+                       f"{dev} has {len(active)} stories In-Progress — help them finish one first"))
+    return agenda
+
+
+# --------------------------------------------------------------------------
+# Comms mining: search sqlite transcript/chat/email pools for stories & devs
+# --------------------------------------------------------------------------
+
+def _text_columns(con, table):
+    cols = con.execute(f'PRAGMA table_info("{table}")').fetchall()
+    text_cols = [c[1] for c in cols
+                 if not c[2] or any(t in (c[2] or "").upper() for t in ("CHAR", "TEXT", "CLOB"))]
+    date_cols = [c[1] for c in cols
+                 if re.search(r"date|time|created|updated|ts", c[1], re.IGNORECASE)]
+    return text_cols, (date_cols[0] if date_cols else None)
+
+
+def search_comms(cfg, terms, limit):
+    """Search every configured sqlite DB's text columns for the given terms.
+    Returns [{source, table, date, snippet}] newest-ish first. Schema-agnostic:
+    tables and text columns are discovered, not assumed."""
+    results = []
+    terms = [t for t in terms if t and len(t) >= 3]
+    if not terms:
+        return results
+    for raw_path in cfg["sources"]["sqlite"]:
+        path = Path(raw_path).expanduser()
+        if not path.is_file():
+            warn(f"[sources].sqlite entry not found: {path}")
+            continue
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            con.row_factory = sqlite3.Row
+            tables = [r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()]
+            for table in tables:
+                try:
+                    text_cols, date_col = _text_columns(con, table)
+                    if not text_cols:
+                        continue
+                    where = " OR ".join(
+                        f'"{c}" LIKE ?' for c in text_cols for _ in terms
+                    )
+                    params = [f"%{t}%" for _ in text_cols for t in terms]
+                    order = f'ORDER BY "{date_col}" DESC' if date_col else ""
+                    rows = con.execute(
+                        f'SELECT * FROM "{table}" WHERE {where} {order} LIMIT ?',
+                        params + [limit],
+                    ).fetchall()
+                    for row in rows:
+                        best = ""
+                        for c in text_cols:
+                            v = str(row[c] or "")
+                            if any(t.lower() in v.lower() for t in terms) and len(v) > len(best):
+                                best = v
+                        if not best:
+                            continue
+                        for t in terms:
+                            i = best.lower().find(t.lower())
+                            if i >= 0:
+                                best = best[max(0, i - 120):i + 240]
+                                break
+                        results.append({
+                            "source": path.stem,
+                            "table": table,
+                            "date": str(row[date_col])[:16] if date_col else "",
+                            "snippet": " ".join(best.split()),
+                        })
+                except sqlite3.Error:
+                    continue
+            con.close()
+        except sqlite3.Error as e:
+            warn(f"Cannot search {path}: {e}")
+    results.sort(key=lambda r: r["date"], reverse=True)
+    return results[:limit]
+
+
+def load_action_items(cfg):
+    """Open '- [ ]' items from the configured markdown checklist, or None if
+    not configured."""
+    path_cfg = cfg["sources"]["action_items"]
+    if not path_cfg:
+        return None
+    path = Path(path_cfg)
+    if not path.is_absolute():
+        path = cfg["_dir"] / path
+    path = path.expanduser()
+    if not path.is_file():
+        return {"path": path, "open": [], "missing": True}
+    items = []
+    try:
+        for line in path.read_text(errors="replace").splitlines():
+            m = re.match(r"\s*[-*]\s*\[( |x|X)\]\s*(.+)", line)
+            if m and m.group(1) == " ":
+                items.append(m.group(2).strip())
+    except OSError as e:
+        warn(f"Cannot read action items file {path}: {e}")
+    return {"path": path, "open": items, "missing": False}
+
+
+# --------------------------------------------------------------------------
 # History / snapshots (drives the burndown charts)
 # --------------------------------------------------------------------------
 
@@ -791,7 +1248,10 @@ def record_snapshot(history, today, sprint_n, per_dev_current):
             "total": total_points(stories),
         }
         for s in stories:
-            snap["stories"][s.sid] = {"todo": s.todo_hours, "state": s.state}
+            snap["stories"][s.sid] = {
+                "todo": s.todo_hours, "state": s.state,
+                "points": s.points, "blocked": s.blocked,
+            }
     snap["pod"] = {
         "remaining": sum(d["remaining"] for d in snap["devs"].values()),
         "total": sum(d["total"] for d in snap["devs"].values()),
@@ -936,6 +1396,24 @@ ul.risks { margin:0; padding-left:18px; } ul.risks li { margin:5px 0; }
 .chart .legend { fill:var(--muted); font-size:10px; }
 .chart .today { stroke:var(--warnc); stroke-width:1; stroke-dasharray:2 3; }
 .chart .todaylab { fill:var(--warnc); font-size:10px; }
+.lat { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; }
+.lat-green { background:var(--ok); } .lat-yellow { background:var(--warnc); }
+.lat-red { background:var(--bad); }
+.matrix td, .matrix th { text-align:center; }
+.matrix td:first-child, .matrix th:first-child { text-align:left; }
+.m-merged { color:var(--ok); font-weight:700; } .m-open { color:var(--accent); }
+.m-declined { color:var(--bad); } .m-none { color:var(--line); }
+.agenda li { margin:6px 0; }
+.owner { display:inline-block; min-width:96px; font-weight:700; color:var(--muted);
+         font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+.scorebox { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
+.scorebox > div { background:var(--bg); border:1px solid var(--line); border-radius:8px;
+                  padding:6px 12px; text-align:center; }
+.scorebox .num { font-size:20px; font-weight:700; } .scorebox .lbl { font-size:11px;
+                  color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
+.good { color:var(--ok); }
+.snippet { font-size:13px; color:var(--muted); margin:4px 0 4px 16px; }
+.snippet b { color:var(--fg); }
 .charts { display:flex; flex-wrap:wrap; gap:16px; }
 .charts > div { flex:1 1 460px; }
 """
@@ -959,11 +1437,15 @@ def pct_bar(pct):
     )
 
 
+def lat_dot(story):
+    return f'<span class="lat lat-{story.lateness or "green"}" title="{story.lateness}"></span>'
+
+
 def render_story(story, sprint_n, current_sprint):
     h = [f'<div class="card">']
     pts = f"{story.points:g} pts" if story.points is not None else "unestimated"
     h.append(
-        f'<div><a href="{esc(story.url)}"><strong>{esc(story.sid)}</strong></a> '
+        f'<div>{lat_dot(story)} <a href="{esc(story.url)}"><strong>{esc(story.sid)}</strong></a> '
         f"{esc(story.name)} &nbsp;{state_badge(story)} "
         f'<span class="muted">· {esc(story.kind)} · {pts} · '
         f"{story.discussions} discussion(s)</span></div>"
@@ -979,11 +1461,30 @@ def render_story(story, sprint_n, current_sprint):
                 note_html = f' <span class="muted">— {esc(note)}</span>' if note else ""
             else:
                 pct, note_html = story.completion, ' <span class="muted">— story-level estimate</span>'
-            h.append(f"<li>{pct_bar(pct)} {esc(ac)}{note_html}</li>")
+            tested = ""
+            if story.ac_tested:
+                tested = (' <span class="good" title="tested behaviorally">✓ tested</span>'
+                          if story.ac_tested[i]
+                          else ' <span class="risk" title="no behavioral test found">✗ untested</span>')
+            h.append(f"<li>{pct_bar(pct)} {esc(ac)}{tested}{note_html}</li>")
         h.append("</ul>")
     else:
         h.append('<div class="warn">None found on the story.</div>')
     h.append("</div>")
+
+    if story.tests_style or story.coverage_note or story.arch_note or story.ai_concerns:
+        h.append('<div class="sec"><div class="seclab">Code &amp; test assessment</div>')
+        if story.tests_style:
+            cls = "good" if story.tests_style == "behavioral" else \
+                  ("risk" if story.tests_style in ("implementation", "none") else "warn")
+            h.append(f'<div>Tests: <span class="{cls}">{esc(story.tests_style)}</span>'
+                     + (f' · coverage: {esc(story.coverage_note)}' if story.coverage_note else "")
+                     + "</div>")
+        if story.arch_note:
+            h.append(f"<div>Architecture: {esc(story.arch_note)}</div>")
+        for c in story.ai_concerns:
+            h.append(f'<div class="warn">⚠ {esc(c)}</div>')
+        h.append("</div>")
 
     h.append('<div class="sec"><div class="seclab">Branch &amp; pull requests</div>')
     if story.branches:
@@ -1003,12 +1504,21 @@ def render_story(story, sprint_n, current_sprint):
             for pr in b.prs:
                 extra = " · DRAFT" if pr.draft else ""
                 review = f" · {esc(pr.review)}" if pr.review else ""
+                size = f" · +{pr.additions}/−{pr.deletions}" if (pr.additions or pr.deletions) else ""
+                checks = ""
+                if pr.checks_total:
+                    if pr.checks_failed:
+                        checks = f' · <span class="risk">{pr.checks_failed} check(s) failing</span>'
+                    elif pr.checks_pending:
+                        checks = f' · <span class="warn">{pr.checks_pending} check(s) pending</span>'
+                    else:
+                        checks = ' · <span class="good">checks green</span>'
                 h.append(
-                    f'<div class="prline"><strong>PR</strong> '
+                    f'<div class="prline"><strong>PR → {esc(pr.base or "?")}</strong> '
                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a> '
-                    f'<span class="muted">— {esc(pr.state)}{extra}{review} · '
+                    f'<span class="muted">— {esc(pr.state)}{extra}{review}{size} · '
                     f"{pr.comments} comment(s) · opened {esc(pr.created)}, "
-                    f"updated {esc(pr.updated)}</span></div>"
+                    f"updated {esc(pr.updated)}</span>{checks}</div>"
                 )
         if not story.all_prs and not story.done:
             h.append('<div class="warn">Branch exists but no PR raised yet.</div>')
@@ -1027,7 +1537,11 @@ def render_story(story, sprint_n, current_sprint):
     return "".join(h)
 
 
-def render_report(cfg, today, current_sprint, sprints, per_dev):
+MATRIX_SYMBOL = {"merged": ("✓", "m-merged"), "open": ("●", "m-open"),
+                 "declined": ("✗", "m-declined"), "-": ("—", "m-none")}
+
+
+def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     pod = cfg["pod"]["name"]
     length = cfg["sprint"]["length_days"]
     start, end = sprint_window(cfg, current_sprint)
@@ -1038,35 +1552,62 @@ def render_report(cfg, today, current_sprint, sprints, per_dev):
     all_stories = [s for dev in per_dev.values() for sp in dev.values() for s in sp]
     all_risks = [(s, r) for s in all_stories for r in s.risks]
     blocked = [s for s in all_stories if s.blocked]
+    out_today = analysis["out_today"]
 
+    out_note = f" · out today: {esc(', '.join(sorted(out_today)))}" if out_today else ""
     h = [
         f"<title>{esc(pod)} audit {today.isoformat()}</title>",
         f"<style>{CSS}</style>",
-        f"<h1>{esc(pod)} — daily audit</h1>",
+        f"<h1>{esc(pod)} — morning report</h1>",
         f'<div class="sub">{today.strftime("%A %d %B %Y")} · {esc(it_name)} '
         f"({start.isoformat()} → {end.isoformat()}) · day {day_no} of {length} · "
-        f"includes {len(sprints) - 1} previous sprint(s)</div>",
+        f"includes {len(sprints) - 1} previous sprint(s){out_note}</div>",
     ]
+
+    # --- Yesterday at a glance
+    h.append("<h2>Since the last report</h2>")
+    if analysis["digest"]:
+        h.append("<ul class='risks'>")
+        for e in analysis["digest"][:20]:
+            h.append(f"<li>{esc(e)}</li>")
+        h.append("</ul>")
+    else:
+        h.append('<div class="muted">No recorded changes (first run, or a quiet day).</div>')
+
+    # --- Conversations to have today
+    h.append("<h2>Conversations to have today</h2>")
+    if analysis["agenda"]:
+        h.append("<ul class='agenda' style='list-style:none;padding-left:0'>")
+        for owner, text in analysis["agenda"]:
+            h.append(f'<li><span class="owner">{esc(owner)}</span> {esc(text)}</li>')
+        h.append("</ul>")
+    else:
+        h.append('<div class="muted">Nothing needs an intervention this morning. 🎉</div>')
 
     # --- Pod summary table
     h.append("<h2>Pod summary</h2><table><tr><th>Dev</th>"
              "<th class='num'>Stories</th><th class='num'>Points</th>"
              "<th class='num'>Accepted</th><th class='num'>Remaining</th>"
              "<th class='num'>PRs open</th><th class='num'>Blocked</th>"
-             "<th class='num'>Risks</th></tr>")
+             "<th class='num'>G / Y / R</th></tr>")
     for dev, by_sprint in per_dev.items():
         cur = by_sprint.get(current_sprint, [])
         everything = [s for sp in by_sprint.values() for s in sp]
         open_prs = sum(1 for s in everything for pr in s.all_prs if pr.state == "OPEN")
+        g = sum(1 for s in everything if s.lateness == "green")
+        y = sum(1 for s in everything if s.lateness == "yellow")
+        r_ = sum(1 for s in everything if s.lateness == "red")
+        dev_label = esc(dev) + (" <span class='muted'>(out)</span>" if dev in out_today else "")
         h.append(
-            f"<tr><td>{esc(dev)}</td>"
+            f"<tr><td>{dev_label}</td>"
             f"<td class='num'>{len(cur)}</td>"
             f"<td class='num'>{total_points(cur):g}</td>"
             f"<td class='num'>{total_points(cur) - remaining_points(cur):g}</td>"
             f"<td class='num'>{remaining_points(cur):g}</td>"
             f"<td class='num'>{open_prs}</td>"
             f"<td class='num'>{sum(1 for s in everything if s.blocked)}</td>"
-            f"<td class='num'>{sum(len(s.risks) for s in everything)}</td></tr>"
+            f"<td class='num'><span class='good'>{g}</span> / "
+            f"<span class='warn'>{y}</span> / <span class='risk'>{r_}</span></td></tr>"
         )
     h.append(
         f"<tr><th>Pod</th><th class='num'>{len(all_current)}</th>"
@@ -1075,8 +1616,108 @@ def render_report(cfg, today, current_sprint, sprints, per_dev):
         f"<th class='num'>{remaining_points(all_current):g}</th>"
         f"<th class='num'>{sum(1 for s in all_stories for pr in s.all_prs if pr.state == 'OPEN')}</th>"
         f"<th class='num'>{len(blocked)}</th>"
-        f"<th class='num'>{len(all_risks)}</th></tr></table>"
+        f"<th class='num'>{len(all_risks)} risks</th></tr></table>"
     )
+
+    # --- Promotion matrix
+    targets = analysis["targets"]
+    if targets:
+        h.append("<h2>Promotion matrix</h2>")
+        h.append('<table class="matrix"><tr><th>Story</th><th>Dev</th>'
+                 + "".join(f"<th>{esc(t)}</th>" for t in targets) + "</tr>")
+        for dev, by_sprint in per_dev.items():
+            for s in sorted(by_sprint.get(current_sprint, []), key=lambda x: x.sid):
+                row = promotion_matrix(s, targets)
+                cells = ""
+                for t in targets:
+                    sym, cls = MATRIX_SYMBOL[row[t]]
+                    cells += f'<td class="{cls}" title="{row[t]}">{sym}</td>'
+                h.append(f'<tr><td>{lat_dot(s)} <a href="{esc(s.url)}">{esc(s.sid)}</a></td>'
+                         f"<td>{esc(dev)}</td>{cells}</tr>")
+        h.append("</table>")
+        h.append('<div class="muted">✓ merged · ● PR open · ✗ PR declined/closed · — no PR</div>')
+
+    # --- Reviews & CI
+    h.append("<h2>Reviews &amp; CI</h2>")
+    waiting = analysis["waiting_reviews"]
+    if waiting:
+        h.append("<div><strong>PRs waiting on a first review</strong></div><ul class='risks'>")
+        for s, pr, wait in waiting:
+            who = ", ".join(pr.awaiting) or "no reviewer assigned"
+            cls = "risk" if wait >= cfg["risks"]["review_wait_days"] else ""
+            h.append(f'<li class="{cls}">{esc(s.sid)} — waiting {wait}d ({esc(who)}): '
+                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+        h.append("</ul>")
+    else:
+        h.append('<div class="muted">No PRs waiting on review.</div>')
+    failing = [(s, pr) for s in all_stories for pr in s.all_prs
+               if pr.state == "OPEN" and pr.checks_failed]
+    if failing:
+        h.append("<div><strong>Failing checks</strong></div><ul class='risks'>")
+        for s, pr in failing:
+            h.append(f'<li class="risk">{esc(s.sid)} — {pr.checks_failed} failing: '
+                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+        h.append("</ul>")
+    big = [(s, pr) for s in all_stories for pr in s.all_prs
+           if pr.state == "OPEN" and (pr.additions + pr.deletions) > cfg["risks"]["big_pr_lines"]]
+    if big:
+        h.append("<div><strong>Oversized PRs</strong></div><ul class='risks'>")
+        for s, pr in big:
+            h.append(f'<li class="warn">{esc(s.sid)} — +{pr.additions}/−{pr.deletions}: '
+                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+        h.append("</ul>")
+    if analysis["review_load"]:
+        load = sorted(analysis["review_load"].items(), key=lambda kv: -kv[1])
+        h.append('<div><strong>Review load</strong> <span class="muted">— '
+                 + ", ".join(f"{esc(k)}: {v}" for k, v in load) + "</span></div>")
+
+    # --- Blockers & acceptance aging
+    h.append("<h2>Blocked &amp; awaiting acceptance</h2>")
+    if analysis["blocked_aging"]:
+        h.append("<ul class='risks'>")
+        for s, days in analysis["blocked_aging"]:
+            h.append(f'<li class="risk"><strong>{esc(s.sid)}</strong> blocked {days}d — '
+                     f"{esc(s.blocked_reason or 'no reason recorded')}</li>")
+        h.append("</ul>")
+    if analysis["accept_queue"]:
+        h.append("<div><strong>Awaiting PO acceptance</strong></div><ul class='risks'>")
+        for s, days in analysis["accept_queue"]:
+            cls = "risk" if days >= cfg["risks"]["acceptance_wait_days"] else ""
+            h.append(f'<li class="{cls}">{esc(s.sid)} — Completed for {days}d</li>')
+        h.append("</ul>")
+    if not analysis["blocked_aging"] and not analysis["accept_queue"]:
+        h.append('<div class="muted">Nothing blocked, nothing waiting on acceptance.</div>')
+
+    # --- Scope churn
+    churn = analysis["churn"]
+    if churn and churn["added"]:
+        h.append("<h2>Scope change</h2><ul class='risks'>")
+        for s in churn["added"]:
+            pts = f"{s.points:g} pts" if s.points is not None else "unestimated"
+            h.append(f'<li class="warn">{esc(s.sid)} ({pts}) added after sprint start '
+                     f'(baseline {esc(churn["baseline_date"])})</li>')
+        h.append("</ul>")
+
+    # --- Action items
+    actions = analysis["actions"]
+    if actions is not None:
+        h.append("<h2>Action items</h2>")
+        if actions.get("missing"):
+            h.append(f'<div class="warn">Action items file not found: {esc(str(actions["path"]))}</div>')
+        elif actions["open"]:
+            h.append("<ul class='risks'>")
+            for item in actions["open"]:
+                h.append(f"<li>☐ {esc(item)}</li>")
+            h.append("</ul>")
+        else:
+            h.append('<div class="muted">No open action items. 🎉</div>')
+
+    # --- Hygiene
+    if analysis["hygiene"]:
+        h.append("<h2>Data hygiene</h2><ul class='risks'>")
+        for dev, s, problem in analysis["hygiene"]:
+            h.append(f'<li class="warn">{esc(s.sid)} ({esc(dev)}): {esc(problem)}</li>')
+        h.append("</ul>")
 
     # --- Pod burndown: one chart per sprint, newest first, reconstructed
     # from Rally acceptance dates.
@@ -1095,8 +1736,8 @@ def render_report(cfg, today, current_sprint, sprints, per_dev):
         ) + "</div>")
     h.append("</div>")
 
-    # --- Blockers & risks up front
-    h.append("<h2>Blockers &amp; risks</h2>")
+    # --- All flagged risks
+    h.append("<h2>All flagged risks</h2>")
     if all_risks:
         h.append("<ul class='risks'>")
         for s, (tag, msg) in all_risks:
@@ -1107,7 +1748,44 @@ def render_report(cfg, today, current_sprint, sprints, per_dev):
 
     # --- Per-dev sections
     for dev, by_sprint in per_dev.items():
-        h.append(f"<h2>{esc(dev)}</h2>")
+        out_tag = ' <span class="muted">(out today)</span>' if dev in out_today else ""
+        h.append(f"<h2>{esc(dev)}{out_tag}</h2>")
+
+        card = analysis["coaching"].get(dev)
+        if card:
+            risk = str(card.get("risk") or "none")
+            risk_cls = {"none": "good", "watch": "warn", "action": "risk"}.get(risk, "muted")
+            h.append('<div class="card"><div class="seclab">Scorecard &amp; coaching</div>')
+            h.append('<div class="scorebox">')
+            for k in ("delivery", "quality", "communication", "collaboration"):
+                v = card.get("scores", {}).get(k, "?")
+                h.append(f'<div><div class="num">{esc(v)}</div><div class="lbl">{esc(k)}</div></div>')
+            h.append(f'<div><div class="num {risk_cls}">{esc(risk)}</div><div class="lbl">risk</div></div>')
+            h.append("</div>")
+            if risk != "none" and card.get("risk_reason"):
+                h.append(f'<div class="{risk_cls}">⚠ {esc(card["risk_reason"])}</div>')
+            for s_txt in card.get("strengths") or []:
+                h.append(f'<div class="good">＋ {esc(s_txt)}</div>')
+            for c_txt in card.get("coaching") or []:
+                h.append(f"<div>→ {esc(c_txt)}</div>")
+            qs = card.get("questions_requests") or []
+            if qs:
+                h.append('<div class="sec"><div class="seclab">Outstanding questions / requests from them</div>')
+                for q in qs:
+                    h.append(f"<div>? {esc(q)}</div>")
+                h.append("</div>")
+            h.append("</div>")
+        elif analysis["ai_enabled"]:
+            h.append('<div class="muted">No coaching analysis available today.</div>')
+
+        snippets = analysis["comms"].get(dev) or []
+        if snippets:
+            h.append('<div class="card"><div class="seclab">Recent mentions in transcripts / chats / email</div>')
+            for sn in snippets:
+                src = f"{sn['source']}.{sn['table']}" + (f" · {sn['date']}" if sn["date"] else "")
+                h.append(f'<div class="snippet"><b>{esc(src)}</b> — {esc(sn["snippet"])}</div>')
+            h.append("</div>")
+
         h.append("<div class='charts'>")
         for n in reversed(sprints):
             s_start, s_end = sprint_window(cfg, n)
@@ -1268,23 +1946,33 @@ def html_to_pdf(html_path, pdf_path):
 # Terminal summary
 # --------------------------------------------------------------------------
 
-def print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path=None):
+def print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path=None, analysis=None):
     start, _ = sprint_window(cfg, current_sprint)
     day_no = (today - start).days + 1
+    lat_mark = {"green": "G", "yellow": "Y", "red": "R", "": "-"}
     print()
     print("=" * 62)
     print(f" {cfg['pod']['name']} — {iteration_name(cfg, current_sprint)}, "
           f"day {day_no} of {cfg['sprint']['length_days']}  ({today.isoformat()})")
     print("=" * 62)
+    if analysis and analysis.get("agenda"):
+        print("\n Conversations to have today:")
+        for owner, text in analysis["agenda"]:
+            print(f"   [{owner}] {text}")
     for dev, by_sprint in per_dev.items():
         cur = by_sprint.get(current_sprint, [])
         everything = [s for sp in by_sprint.values() for s in sp]
         done = total_points(cur) - remaining_points(cur)
-        print(f"\n {dev}: {len(cur)} stories, {done:g}/{total_points(cur):g} pts accepted")
+        card = (analysis or {}).get("coaching", {}).get(dev)
+        risk_note = ""
+        if card and card.get("risk") not in (None, "none"):
+            risk_note = f"  [coach: {card['risk']}]"
+        print(f"\n {dev}: {len(cur)} stories, {done:g}/{total_points(cur):g} pts accepted{risk_note}")
         for s in everything:
             flags = " ".join(f"[{t}]" for t, _ in s.risks)
             marker = "✔" if s.done else ("✖" if s.blocked else "·")
-            print(f"   {marker} {s.sid} {s.state:<12} {s.completion:>3}%  {s.name[:48]}"
+            print(f"   {marker} {lat_mark.get(s.lateness, '-')} {s.sid} {s.state:<12} "
+                  f"{s.completion:>3}%  {s.name[:44]}"
                   + (f"  {flags}" if flags else ""))
     risks = [(s, r) for sp in per_dev.values() for st in sp.values() for s in st for r in s.risks]
     print(f"\n Risks flagged: {len(risks)}")
@@ -1514,12 +2202,10 @@ def main():
                             story.branches.append(b)
                     if ai_enabled and story.acs and story.branches and not story.done:
                         path, branch, default, _ = index.find(story.sid)[0]
-                        info(f"AI-scoring ACs for {story.sid}...")
+                        info(f"AI analysis for {story.sid}...")
                         diff = branch_diff_text(index, path, branch, default,
                                                 cfg["ai"]["max_diff_chars"])
-                        scores = ai_score_acs(story, diff, cfg)
-                        if scores:
-                            story.ac_scores = scores
+                        ai_story_analysis(story, diff, cfg)
                 except Exception as e:
                     warn(f"Branch/PR enrichment failed for {story.sid}: "
                          f"{e.__class__.__name__}: {e}")
@@ -1535,9 +2221,68 @@ def main():
         warn("dev names don't exactly match Rally display names, or wrong workspace/project.")
         warn(f"Run  {sys.argv[0]} --check  to diagnose.")
 
-    # Snapshot for burndown, then render.
-    record_snapshot(history, today, current_sprint,
-                    {dev: sp.get(current_sprint, []) for dev, sp in per_dev.items()})
+    # Snapshot for burndown/aging, then run the leadership analyses.
+    per_dev_current = {dev: sp.get(current_sprint, []) for dev, sp in per_dev.items()}
+    record_snapshot(history, today, current_sprint, per_dev_current)
+
+    all_stories = [s for sp in per_dev.values() for st in sp.values() for s in st]
+    for dev, by_sprint in per_dev.items():
+        for n, stories in by_sprint.items():
+            for s in stories:
+                score_lateness(s, n, current_sprint, elapsed_pct, cfg)
+
+    targets = resolve_targets(cfg, current_sprint)
+    waiting_reviews, review_load = review_stats(all_stories, today, cfg)
+    blocked_aging, accept_queue = aging_queues(all_stories, history, today, cfg)
+    churn = scope_churn(history, current_sprint, per_dev_current, today)
+    digest = yesterday_digest(history, all_stories, today)
+    wip_flags, hygiene = wip_and_hygiene(per_dev, current_sprint, cfg)
+    out_today = set(cfg["capacity"]["out"])
+    agenda = build_agenda(per_dev, blocked_aging, accept_queue, waiting_reviews,
+                          wip_flags, cfg, out_today)
+
+    comms_by_dev = {}
+    if cfg["sources"]["sqlite"]:
+        info("Searching communications sources...")
+        for dev, by_sprint in per_dev.items():
+            terms = [dev] + ([dev.split()[0]] if " " in dev else []) \
+                + [s.sid for sp in by_sprint.values() for s in sp]
+            comms_by_dev[dev] = search_comms(cfg, terms, cfg["sources"]["max_snippets_per_dev"])
+
+    coaching = {}
+    if ai_enabled and cfg["ai"]["coaching"]:
+        history.setdefault("coaching", {})
+        for dev, by_sprint in per_dev.items():
+            info(f"Coaching analysis for {dev}...")
+            facts = {
+                "sprint_elapsed_pct": round(elapsed_pct),
+                "out_today": dev in out_today,
+                "stories": [
+                    {
+                        "id": s.sid, "name": s.name, "state": s.state,
+                        "points": s.points, "completion_pct": s.completion,
+                        "lateness": s.lateness,
+                        "risks": [m for _, m in s.risks],
+                        "tests_style": s.tests_style,
+                        "prs": [
+                            {"state": pr.state, "base": pr.base,
+                             "comments": pr.comments,
+                             "size": pr.additions + pr.deletions,
+                             "checks_failed": pr.checks_failed}
+                            for pr in s.all_prs
+                        ],
+                    }
+                    for sp in by_sprint.values() for s in sp
+                ],
+                "recent_communications": comms_by_dev.get(dev, []),
+                "pod_review_counts": review_load,
+            }
+            prev_card = (history["coaching"].get(dev) or {}).get("card")
+            card = ai_dev_coaching(dev, facts, prev_card, cfg)
+            if card:
+                coaching[dev] = card
+                history["coaching"][dev] = {"date": today.isoformat(), "card": card}
+
     try:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         with open(history_path, "w") as f:
@@ -1545,7 +2290,24 @@ def main():
     except OSError as e:
         die(f"Cannot write history file {history_path}: {e}")
 
-    html_out = render_report(cfg, today, current_sprint, sprints, per_dev)
+    analysis = {
+        "targets": targets,
+        "waiting_reviews": waiting_reviews,
+        "review_load": review_load,
+        "blocked_aging": blocked_aging,
+        "accept_queue": accept_queue,
+        "churn": churn,
+        "digest": digest,
+        "wip_flags": wip_flags,
+        "hygiene": hygiene,
+        "agenda": agenda,
+        "actions": load_action_items(cfg),
+        "comms": comms_by_dev,
+        "coaching": coaching,
+        "ai_enabled": ai_enabled,
+        "out_today": out_today,
+    }
+    html_out = render_report(cfg, today, current_sprint, sprints, per_dev, analysis)
     slug = re.sub(r"[^a-z0-9]+", "-", cfg["pod"]["name"].lower()).strip("-") or "pod"
     try:
         out_dir = (cfg["_dir"] / cfg["report"]["output_dir"]).expanduser()
@@ -1561,7 +2323,7 @@ def main():
         if html_to_pdf(report_path, candidate):
             pdf_path = candidate
 
-    print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path)
+    print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path, analysis)
     if args.open:
         try:
             webbrowser.open(report_path.as_uri())
