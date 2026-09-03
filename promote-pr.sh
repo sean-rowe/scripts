@@ -61,6 +61,8 @@
 #   --yes                 Skip confirmation of the resolved PR list
 #   --dry-run             Show what would happen without changing anything
 #   --continue            Resume an interrupted run after fixing conflicts
+#   --no-verify           Skip commit hooks when finishing a conflicted
+#                         commit (use with --continue when a hook fails it)
 #   --abort               Abandon an interrupted run and delete its branch
 #
 # Requires: gh (authenticated) and jq. GitHub repos only.
@@ -84,6 +86,7 @@ DRY_RUN=false
 CONTINUE_RUN=false
 ABORT_RUN=false
 FORCE_PUSH=false
+NO_VERIFY=false
 
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -111,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --yes)            ASSUME_YES=true; shift ;;
     --dry-run)        DRY_RUN=true; shift ;;
     --continue)       CONTINUE_RUN=true; shift ;;
+    --no-verify)      NO_VERIFY=true; shift ;;
     --abort)          ABORT_RUN=true; shift ;;
     -h|--help)        usage 0 ;;
     *)                die "Unknown argument: $1 (use --help)" ;;
@@ -139,6 +143,7 @@ OPEN_PR=$OPEN_PR
 PR_LIST='${PRS[*]-}'
 NEW_BRANCH='$NEW_BRANCH'
 FORCE_PUSH=$FORCE_PUSH
+NO_VERIFY=$NO_VERIFY
 NEXT_INDEX=$1
 COMMITS_STR='${COMMITS[*]-}'
 EOF
@@ -195,8 +200,11 @@ START_INDEX=0
 if $CONTINUE_RUN; then
   [[ -f "$STATE_FILE" ]] \
     || die "No interrupted $SCRIPT_NAME run found (nothing to --continue)"
+  CLI_NO_VERIFY=$NO_VERIFY
   # shellcheck disable=SC1090
   . "$STATE_FILE"
+  # a --no-verify given on this command line wins over the saved value
+  if $CLI_NO_VERIFY; then NO_VERIFY=true; fi
   # shellcheck disable=SC2206
   COMMITS=($COMMITS_STR)
   # shellcheck disable=SC2206
@@ -489,21 +497,42 @@ else
     git switch "$NEW_BRANCH"
   fi
 
+  COMMIT_ARGS=(--no-edit)
+  if $NO_VERIFY; then COMMIT_ARGS+=(--no-verify); fi
+
   if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
     stage_resolved_files
     info "Finishing the interrupted merge..."
-    GIT_EDITOR=true git commit --no-edit >/dev/null 2>&1 \
-      || die "'git commit' failed to finish the merge. Resolve the problem and re-run --continue."
+    if ! FINISH_OUT=$(GIT_EDITOR=true git commit "${COMMIT_ARGS[@]}" 2>&1); then
+      echo "$FINISH_OUT" >&2
+      echo "" >&2
+      echo "'git commit' failed to finish the merge (its output is above)." >&2
+      echo "If a commit hook caused it, re-run with: $SCRIPT_NAME --continue --no-verify" >&2
+      exit 1
+    fi
   elif git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
     stage_resolved_files
     info "Finishing the interrupted cherry-pick..."
-    if ! GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
+    # With --no-verify, finish via 'git commit' directly: 'git cherry-pick
+    # --continue' has no way to skip commit hooks.
+    if $NO_VERIFY; then
+      FINISH_CMD=(git commit "${COMMIT_ARGS[@]}")
+    else
+      FINISH_CMD=(git cherry-pick --continue)
+    fi
+    if ! FINISH_OUT=$(GIT_EDITOR=true "${FINISH_CMD[@]}" 2>&1); then
       if [[ -z "$(git diff --cached --name-only)" ]]; then
         info "Resolution left nothing to apply; skipping that commit."
         git cherry-pick --skip >/dev/null 2>&1 || git cherry-pick --quit >/dev/null 2>&1 || true
       else
-        die "'git cherry-pick --continue' failed. Resolve the problem and re-run --continue."
+        echo "$FINISH_OUT" >&2
+        echo "" >&2
+        echo "Finishing the cherry-pick failed (its output is above)." >&2
+        echo "If a commit hook caused it, re-run with: $SCRIPT_NAME --continue --no-verify" >&2
+        exit 1
       fi
+    elif $NO_VERIFY; then
+      git cherry-pick --quit >/dev/null 2>&1 || true
     fi
   fi
 fi
