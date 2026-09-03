@@ -47,11 +47,15 @@ import argparse
 import datetime as dt
 import fnmatch
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+
+# Rally FormattedIDs: two letters then digits (US123456, DE9911, TA/TS...).
+STORY_ID_RE = re.compile(r"[A-Z]{2}\d{3,}")
 
 SOURCE_EXT = {
     # languages
@@ -440,20 +444,41 @@ def main():
             die(f"Cannot write {out}: {e}")
         out_name = out.name
 
+    # The story is the point of the exercise, so ask for it rather than
+    # quietly producing a pack with no story in it.
+    sid = args.story
+    if not sid and not args.no_story:
+        if sys.stdin.isatty():
+            while True:
+                sid = input("Rally story or defect id (e.g. US847435, "
+                            "or Enter to skip): ").strip()
+                if not sid:
+                    break
+                if STORY_ID_RE.fullmatch(sid.upper()):
+                    sid = sid.upper()
+                    break
+                print("  That does not look like a Rally id — expected two "
+                      "letters then digits, e.g. US847435 or DE9911.")
+        else:
+            warn("No --story given and not a terminal, so no story was "
+                 "fetched. Pass --story <id>, or --no-story to silence this.")
+
     story = None
-    if args.story and not args.no_story:
+    if sid and not args.no_story:
         if pa is None:
             warn("pod-audit.py unavailable — skipping the Rally lookup")
         else:
             try:
                 cfg = pa.load_config(args.config)
-                info(f"Fetching {args.story} from Rally...")
-                story = fetch_story(cfg, args.story)
+                info(f"Fetching {sid} from Rally...")
+                story = fetch_story(cfg, sid)
                 if story is None:
-                    warn(f"No Rally story or defect found with id {args.story}")
+                    warn(f"No Rally story or defect found with id {sid} — "
+                         "check the id, and that your key can see its project")
             except SystemExit:
-                warn("No Rally API key (set [rally].api_key or RALLY_API_KEY) — "
-                     "packing the code without the story")
+                warn("Rally not configured (needs a config file and "
+                     "[rally].api_key or RALLY_API_KEY) — packing the code "
+                     "without the story")
             except Exception as e:                    # noqa: BLE001
                 warn(f"Rally lookup failed: {e}")
 
@@ -482,6 +507,8 @@ def main():
     print(f" Written:   {out}")
     if story:
         print(f" Story:     {story['sid']} — {story['name']}")
+    else:
+        print(" Story:     none — the prompt has no story context in it")
     print("=" * 62)
     if copied:
         print(" Prompt is on the clipboard. In Copilot: attach the file above,")
