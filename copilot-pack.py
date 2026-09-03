@@ -39,6 +39,8 @@
 #   --exclude <glob>    Skip paths matching this glob (repeatable)
 #   --tests             Include test files (excluded by default: they crowd
 #                       out the code under discussion)
+#   --manifest          Prepend a table of contents (off by default — it is
+#                       hundreds of filenames before the first line of code)
 #   --no-story          Don't touch Rally, just pack the code
 #   --no-clipboard      Print the prompt instead of copying it
 #   --stdout            Write the pack to stdout instead of a file
@@ -392,6 +394,7 @@ def main():
     ap.add_argument("--ext")
     ap.add_argument("--exclude", action="append", default=[])
     ap.add_argument("--tests", action="store_true")
+    ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--no-story", action="store_true")
     ap.add_argument("--no-clipboard", action="store_true")
     ap.add_argument("--stdout", action="store_true")
@@ -419,7 +422,9 @@ def main():
     budget = int(args.max_total_mb * 1024 * 1024)
     chunks, packed, dropped = build_pack(root, kept, budget)
 
-    manifest = "\n".join(f"  {rel}  ({lines} lines)" for rel, lines, _s in packed)
+    # No table of contents by default: on a real repo it is hundreds of lines
+    # of filenames before the first line of code, it repeats what the per-file
+    # headers already say, and it costs context the code should be using.
     header = (
         f"{'#' * 78}\n"
         f"# SOURCE PACK — {root.name}\n"
@@ -427,10 +432,12 @@ def main():
         f"by copilot-pack.py\n"
         f"# {len(packed)} files, {sum(l for _r, l, _s in packed):,} lines. "
         f"First-party source only.\n"
-        f"# File list built from: {mode}\n"
         f"{'#' * 78}\n\n"
-        f"CONTENTS\n{manifest}\n\n"
     )
+    if args.manifest:
+        header += ("CONTENTS\n"
+                   + "\n".join(f"  {rel}  ({lines} lines)"
+                                for rel, lines, _s in packed) + "\n\n")
     body = header + "".join(chunks)
 
     if args.stdout:
