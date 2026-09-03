@@ -1503,6 +1503,30 @@ a:hover { color:var(--bad); }
 .agenda .body .mono { font-size:10pt; font-weight:600; }
 .agenda .link { font:400 8.5pt/1.3 var(--mono); margin-top:5pt; }
 
+/* Attention list: one block per story, its problems nested underneath, so
+   a troubled story reads as one thing to act on rather than as four
+   unrelated rows scattered across four cards. */
+.donelist { background:var(--tintg); padding:8pt 11pt 9pt; margin:0 0 26pt;
+            break-inside:avoid; font:400 9pt/1.5 var(--sans); color:var(--ink2); }
+.donelist .lbl { font:600 7.5pt/1 var(--mono); letter-spacing:.07em;
+                 text-transform:uppercase; color:var(--ok); margin-right:8pt; }
+.donelist .d { display:inline-block; margin-right:14pt; white-space:nowrap; }
+
+.attn { display:grid; gap:7pt; margin:11pt 0 30pt; }
+.attn-item { break-inside:avoid; background:var(--panel); padding:9pt 12pt 10pt;
+             border-left:3pt solid var(--rule2); }
+.attn-item.bad { border-left-color:var(--bad); background:var(--tintr); }
+.attn-item.warn { border-left-color:var(--warnc); background:var(--tinta); }
+.attn-item .hd { font:400 10.5pt/1.35 var(--serif); margin-bottom:5pt; }
+.attn-item .hd .mono { font-size:10.5pt; font-weight:700; }
+.attn-item .hd .nm { font-weight:600; }
+.attn-item .row { display:grid; grid-template-columns:60pt 1fr; gap:7pt;
+                  font:400 9pt/1.4 var(--sans); color:var(--ink2); margin-top:3pt; }
+.attn-item .v { min-width:0; }
+.attn-item .k { font:600 7pt/1.5 var(--mono); letter-spacing:.05em;
+                text-transform:uppercase; color:var(--muted); text-align:right;
+                white-space:nowrap; overflow:hidden; }
+
 .flags { display:grid; grid-template-columns:1fr 1fr; gap:12pt; margin:11pt 0 30pt; }
 .flag { break-inside:avoid; background:var(--panel); border-left:3pt solid var(--rule2); padding:9pt 11pt 10pt; }
 .flag.bad { border-left-color:var(--bad); background:var(--tintr); }
@@ -1861,9 +1885,10 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     failing = [(s, pr) for s, pr in open_prs if pr.checks_failed]
     body.append('<div class="tiles">')
     body.append(_tile("Remaining", f"{remaining:g}", f"of {total:g} pts"))
-    body.append(_tile("Stories", f"{len(all_current)}",
-                      f"{sum(1 for s in all_current if s.done)} accepted",
-                      tone="good", tint="g"))
+    n_open = sum(1 for s in all_current if not s.done)
+    body.append(_tile("Stories open", f"{n_open}",
+                      f"of {len(all_current)}, {len(all_current) - n_open} accepted",
+                      tone="" if n_open else "good", tint="" if n_open else "g"))
     body.append(_tile("PRs open", f"{len(open_prs)}",
                       (f'<span class="risk">{len(unreviewed)} unreviewed</span>'
                        if unreviewed else "all reviewed")))
@@ -1893,46 +1918,86 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     else:
         body.append('<div class="note">Nothing needs an intervention this morning.</div>')
 
-    # "Needs attention now" — every threshold breach, one card each. Each row
-    # carries its owner: a leader reading this must know who to talk to.
-    cards = []
-    if failing:
-        cards.append(_flag("Failing checks", len(failing),
-                           [f"{_sid_who(s)} — {pr.checks_failed} failing" for s, pr in failing]))
-    if unreviewed:
-        cards.append(_flag("Waiting on first review", len(unreviewed),
-                           [f'{_sid_who(s)} — {w}d, reviewer '
-                            f'{esc(", ".join(pr.awaiting) or "unassigned")}'
-                            for s, pr, w in unreviewed]))
-    if analysis["blocked_aging"]:
-        rows = [f'{_sid_who(s)} — {d}d, {esc(s.blocked_reason or "no reason recorded")}'
-                for s, d in analysis["blocked_aging"]]
-        rows.append(f'<span class="muted">Escalate at '
-                    f'{risks_cfg["blocked_escalate_days"]}d.</span>')
-        cards.append(_flag("Blocked", len(analysis["blocked_aging"]), rows))
-    big = [(s, pr) for s, pr in open_prs
+    # "Needs attention now", grouped BY STORY rather than by risk type.
+    # Grouping by type meant one troubled story was scattered across four
+    # cards and the reader had to rejoin them to see it was one conversation.
+    # Each story appears exactly once here, worst first, with every problem
+    # it has listed underneath it.
+    SEV = {"blocked": 0, "failing": 1, "review": 2, "oversized": 3,
+           "acceptance": 4, "risk": 5, "hygiene": 6}
+    trouble = {}
+
+    def add(story, kind, text):
+        e = trouble.setdefault(story.sid, {"story": story, "items": []})
+        e["items"].append((SEV[kind], kind, text))
+
+    for st, d in analysis["blocked_aging"]:
+        add(st, "blocked", f'Blocked {d}d — {esc(st.blocked_reason or "no reason recorded")}'
+                           f' <span class="muted">(escalate at '
+                           f'{risks_cfg["blocked_escalate_days"]}d)</span>')
+    for st, pr in failing:
+        add(st, "failing", f"{pr.checks_failed} check(s) failing on the PR to "
+                           f'<span class="mono">{esc(pr.base or "?")}</span>')
+    for st, pr, w in unreviewed:
+        add(st, "review", f"Waiting {w}d on a first review — "
+                          f'{esc(", ".join(pr.awaiting) or "no reviewer assigned")}')
+    big = [(st, pr) for st, pr in open_prs
            if (pr.additions + pr.deletions) > risks_cfg["big_pr_lines"]]
-    if big:
-        rows = [f"{_sid_who(s)} — +{pr.additions}/−{pr.deletions}" for s, pr in big]
-        rows.append(f'<span class="muted">Threshold {risks_cfg["big_pr_lines"]} lines.</span>')
-        cards.append(_flag("Oversized PRs", len(big), rows, tone="warn"))
-    if analysis["accept_queue"]:
-        rows = [f"{_sid_who(s)} — Completed {d}d" for s, d in analysis["accept_queue"]]
-        rows.append(f'<span class="muted">PO agenda at '
-                    f'{risks_cfg["acceptance_wait_days"]}d.</span>')
-        cards.append(_flag("Awaiting PO acceptance", len(analysis["accept_queue"]),
-                           rows, tone="warn"))
+    for st, pr in big:
+        add(st, "oversized", f"Oversized PR: +{pr.additions}/−{pr.deletions} against a "
+                             f'{risks_cfg["big_pr_lines"]}-line threshold')
+    for st, d in analysis["accept_queue"]:
+        add(st, "acceptance", f"Completed {d}d, still not accepted "
+                              f'<span class="muted">(PO agenda at '
+                              f'{risks_cfg["acceptance_wait_days"]}d)</span>')
+    for st, (tag, msg) in all_risks:
+        if tag.lower() not in ("blocked", "stale-review"):   # already stated above
+            add(st, "risk", f'<span class="mono" style="font-size:8pt;font-weight:600">'
+                            f"{esc(tag.upper())}</span> {esc(msg)}")
+    # Hygiene only joins a story that is already in trouble; a story whose
+    # ONLY problem is a missing estimate belongs in the cleanup panel, not
+    # in the list of things to act on this morning.
+    hygiene_only = []
+    for _dev, st, problem in analysis["hygiene"]:
+        if st.sid in trouble:
+            add(st, "hygiene", esc(problem))
+        else:
+            hygiene_only.append((st, problem))
+
+    if trouble:
+        ranked = sorted(trouble.values(),
+                        key=lambda e: (min(i[0] for i in e["items"]),
+                                       -len(e["items"]), e["story"].sid))
+        body.append("<h2>Needs attention now</h2>")
+        body.append(f'<div class="note">{len(ranked)} stor'
+                    f'{"y" if len(ranked) == 1 else "ies"} need something from '
+                    "someone today, worst first. Every problem each one has is "
+                    "listed under it.</div>")
+        body.append('<div class="attn">')
+        for e in ranked:
+            st = e["story"]
+            worst = min(i[0] for i in e["items"])
+            tone = "bad" if worst <= SEV["failing"] else "warn"
+            rows = "".join(
+                f'<div class="row"><span class="k">{k}</span>'
+                f'<span class="v">{t}</span></div>'
+                for _sv, k, t in sorted(e["items"], key=lambda i: i[0]))
+            body.append(
+                f'<div class="attn-item {tone}">'
+                f'<div class="hd">{lat_dot(st)}'
+                f'<a class="mono" href="{esc(st.url)}">{esc(st.sid)}</a> '
+                f'<span class="nm">{esc(st.name)}</span>{_who(st)}</div>'
+                f"{rows}</div>")
+        body.append("</div>")
+
     actions = analysis["actions"]
     if actions is not None and not actions.get("missing") and actions["open"]:
-        cards.append(_flag("Open action items", len(actions["open"]),
-                           [esc(i) for i in actions["open"][:4]], tone="warn"))
-    if analysis["hygiene"]:
-        cards.append(_flag("Data hygiene", len(analysis["hygiene"]),
-                           [f"{_sid_who(s)} — {esc(problem)}"
-                            for _, s, problem in analysis["hygiene"][:4]], tone="warn"))
-    if cards:
-        body.append("<h2>Needs attention now</h2>")
-        body.append('<div class="flags">' + "".join(cards) + "</div>")
+        body.append('<div class="flags"><div class="flag warn">'
+                    f'<div class="lbl">Open action items · {len(actions["open"])}</div>'
+                    '<div class="body">'
+                    + "".join(f'<div class="row">{esc(i)}</div>'
+                              for i in actions["open"][:6])
+                    + "</div></div></div>")
 
     # Digest + lateness spread, side by side.
     body.append('<div class="twocol"><div>')
@@ -2039,10 +2104,10 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                     '<span class="m-declined">✗</span> declined &nbsp; '
                     '<span class="m-none">—</span> no PR</div>')
     body.append("</div><div>")
-    body.append("<h2>Hygiene &amp; scope</h2>")
+    body.append("<h2>Cleanup — not urgent</h2>")
     rows = []
-    for dev, s, problem in analysis["hygiene"]:
-        rows.append(f"<li>{_sid_who(s)} — {esc(problem)}</li>")
+    for st, problem in hygiene_only:
+        rows.append(f"<li>{_sid_who(st)} — {esc(problem)}</li>")
     churn = analysis["churn"]
     if churn and churn["added"]:
         for s in churn["added"]:
@@ -2060,24 +2125,18 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                     + ", ".join(f"{esc(k)} {v}" for k, v in load) + "</div>")
     body.append("</div></div>")
 
-    body.append("<h2>All flagged risks</h2>")
-    if all_risks:
-        body.append('<table class="data"><thead><tr><th style="width:66pt">Story</th>'
-                    '<th style="width:96pt">Owner</th>'
-                    '<th style="width:78pt">Tag</th><th>Detail</th></tr></thead><tbody>')
-        for s, (tag, msg) in all_risks:
-            owner_cell = (esc(s.owner) if s.owner
-                          else '<span class="risk">unassigned</span>')
-            body.append(f'<tr><td class="mono" style="font-weight:600">{esc(s.sid)}</td>'
-                        f"<td>{owner_cell}</td>"
-                        f'<td class="mono risk" style="font-size:8pt;font-weight:600">'
-                        f"{esc(tag)}</td><td>{esc(msg)}</td></tr>")
-        body.append("</tbody></table>")
-    else:
-        body.append('<div class="note">None detected today.</div>')
-
     # ---- One page per dev ------------------------------------------------
-    for dev, by_sprint in per_dev.items():
+    # Ordered by how much attention the dev needs, not by dict order: the
+    # person you should turn to first should not be on the last page.
+    def dev_weight(item):
+        _dev, by_sprint = item
+        everything = [x for sp in by_sprint.values() for x in sp]
+        return (-sum(1 for x in everything if x.blocked),
+                -sum(1 for x in everything if x.lateness == "red"),
+                -sum(1 for x in everything if x.lateness == "yellow"),
+                _dev)
+
+    for dev, by_sprint in sorted(per_dev.items(), key=dev_weight):
         everything = [s for sp in by_sprint.values() for s in sp]
         cur = by_sprint.get(current_sprint, [])
         nblocked = sum(1 for s in everything if s.blocked)
@@ -2090,6 +2149,57 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                     f'<div class="stat {tone}">{len(cur)} stories · '
                     f'{total_points(cur):g} pts · {remaining_points(cur):g} remaining'
                     + (f" · {nblocked} blocked" if nblocked else "") + "</div></div>")
+
+        if cfg["report"].get("burndown", True):
+            body.append('<div class="charts">')
+            for n in reversed(sprints):
+                s_start, s_end = sprint_window(cfg, n)
+                dev_stories = by_sprint.get(n, [])
+                if not dev_stories and n != current_sprint:
+                    continue
+                label = (f'{esc(iteration_name(cfg, n))} <span class="muted">· '
+                         f'{"current" if n == current_sprint else "closed"}</span>')
+                body.append(_chart_block(label, "", burndown_svg(
+                    f"{dev} — {iteration_name(cfg, n)}", length,
+                    total_points(dev_stories),
+                    burndown_series(dev_stories, s_start, min(today, s_end)),
+                    today_day=(today - s_start).days if n == current_sprint else None)))
+            body.append("</div>")
+
+        for n in sprints:
+            stories = by_sprint.get(n, [])
+            if n != current_sprint:
+                stories = [s for s in stories if not s.done]
+                if not stories:
+                    continue
+                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
+                            "unfinished spillover</div>")
+            else:
+                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
+                            "current</div>")
+                if not stories:
+                    body.append('<div class="line warn">No stories assigned in the '
+                                "current sprint.</div>")
+            # Accepted work is finished work: it gets one line, not a card.
+            # The cards are reserved for what is still in flight, worst first,
+            # which is what anyone reading this in the morning is here for.
+            open_stories = [x for x in stories if not x.done]
+            done_stories = [x for x in stories if x.done]
+            for s in sorted(open_stories, key=lambda x: (
+                    {"red": 0, "yellow": 1}.get(x.lateness, 2), not x.blocked, x.sid)):
+                body.append(render_story(s, n, current_sprint))
+            if not open_stories and stories:
+                body.append('<div class="line good">Nothing open — everything '
+                            "assigned here is accepted.</div>")
+            if done_stories:
+                body.append(f'<div class="donelist"><span class="lbl">Accepted '
+                            f'· {len(done_stories)}</span>'
+                            + " ".join(
+                                f'<span class="d"><a class="mono" href="{esc(x.url)}">'
+                                f'{esc(x.sid)}</a> {esc(x.name)}'
+                                + (f" · {x.points:g} pts" if x.points is not None else "")
+                                + "</span>" for x in sorted(done_stories, key=lambda x: x.sid))
+                            + "</div>")
 
         card = analysis["coaching"].get(dev)
         if card:
@@ -2125,39 +2235,6 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                 body.append(f'<div class="q">“{esc(sn["snippet"])}”'
                             f'<span class="src"> &nbsp;{esc(src)}</span></div>')
             body.append("</div>")
-
-        if cfg["report"].get("burndown", True):
-            body.append('<div class="charts">')
-            for n in reversed(sprints):
-                s_start, s_end = sprint_window(cfg, n)
-                dev_stories = by_sprint.get(n, [])
-                if not dev_stories and n != current_sprint:
-                    continue
-                label = (f'{esc(iteration_name(cfg, n))} <span class="muted">· '
-                         f'{"current" if n == current_sprint else "closed"}</span>')
-                body.append(_chart_block(label, "", burndown_svg(
-                    f"{dev} — {iteration_name(cfg, n)}", length,
-                    total_points(dev_stories),
-                    burndown_series(dev_stories, s_start, min(today, s_end)),
-                    today_day=(today - s_start).days if n == current_sprint else None)))
-            body.append("</div>")
-
-        for n in sprints:
-            stories = by_sprint.get(n, [])
-            if n != current_sprint:
-                stories = [s for s in stories if not s.done]
-                if not stories:
-                    continue
-                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
-                            "unfinished spillover</div>")
-            else:
-                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
-                            "current</div>")
-                if not stories:
-                    body.append('<div class="line warn">No stories assigned in the '
-                                "current sprint.</div>")
-            for s in stories:
-                body.append(render_story(s, n, current_sprint))
         body.append("</div>")
 
     body.append(
