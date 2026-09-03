@@ -37,8 +37,10 @@
 #   --max-total-mb <n>  Stop packing past this much code (default 8)
 #   --ext <list>        Extra comma-separated extensions to include
 #   --exclude <glob>    Skip paths matching this glob (repeatable)
-#   --tests             Include test files (excluded by default: they crowd
-#                       out the code under discussion)
+#   --no-tests          Leave test files out. They are included by default:
+#                       to fix a defect you need to see what is already
+#                       asserted, and what the project's test conventions
+#                       are, before adding to them.
 #   --manifest          Prepend a table of contents (off by default — it is
 #                       hundreds of filenames before the first line of code)
 #   --no-story          Don't touch Rally, just pack the code
@@ -101,10 +103,14 @@ DENY_FILE_GLOBS = [
 ]
 
 TEST_PATTERNS = [
-    "*/test/*", "*/tests/*", "*/__tests__/*", "*/spec/*", "*/e2e/*",
-    "*Test.java", "*Tests.java", "*IT.java", "*.test.ts", "*.test.tsx",
-    "*.test.js", "*.test.jsx", "*.spec.ts", "*.spec.tsx", "*.spec.js",
+    # Maven/Gradle put tests under src/test and src/it; the rest are the
+    # usual per-language naming conventions.
+    "*/test/*", "*/tests/*", "*/it/*", "*/__tests__/*", "*/spec/*", "*/e2e/*",
+    "*Test.java", "*Tests.java", "*TestCase.java", "*IT.java", "*ITCase.java",
+    "*.test.ts", "*.test.tsx", "*.test.js", "*.test.jsx",
+    "*.spec.ts", "*.spec.tsx", "*.spec.js", "*.spec.jsx",
     "test_*.py", "*_test.py", "*_test.go", "*Tests.cs", "*Test.cs",
+    "*_spec.rb", "*.feature",
 ]
 
 
@@ -227,7 +233,7 @@ def collect(root, args):
         if p.suffix.lower() not in allow:
             skipped["ext"] += 1
             continue
-        if not args.tests and is_test(rel):
+        if args.no_tests and is_test(rel):
             skipped["test"] += 1
             continue
         if not p.is_file():
@@ -363,7 +369,38 @@ def build_prompt(story, out_name, packed, dropped, root):
         "2. The exact change for each — a diff or the replacement code.",
         "3. Anything in the story that the code contradicts, or that is too "
         "ambiguous to implement without a decision from me.",
-        "4. The tests to add or update, and what they should assert.",
+        "4. The tests to add or update, written to the rules below.",
+        "",
+        "HOW TO WRITE THE TESTS",
+        "-" * 60,
+        "Write behaviour, not implementation. The existing tests are in the "
+        "pack — match their framework, fixtures, builders and assertion "
+        "style rather than introducing a new one.",
+        "",
+        "- Head each test file with the Gherkin it covers, as a comment "
+        "block at the top: one Feature line, then a Scenario per test with "
+        "Given / When / Then. The Gherkin is the specification; the code "
+        "below it is that specification executed.",
+        "- Group the tests by feature, one group per feature, in the order "
+        "the features appear in the story.",
+        "- Within each feature, order the tests: happy path first, then "
+        "edge cases (boundaries, empty, null, maximum, duplicates, "
+        "ordering), then error cases (invalid input, missing permissions, "
+        "downstream failure, timeout).",
+        "- Label each group with a comment saying which it is, so the three "
+        "kinds stay visually separate.",
+        "- Name each test after the behaviour it proves, phrased as the "
+        "Then clause — not after the method it calls.",
+        "- Assert on observable outcomes: returned values, persisted state, "
+        "emitted events, HTTP status and body. Do not assert on private "
+        "methods, internal call counts, or mock interactions unless the "
+        "interaction with that collaborator IS the contract being specified.",
+        "- One behaviour per test. No branching, loops or conditional "
+        "assertions inside a test body — if you need those, it is two tests.",
+        "- Every Gherkin scenario you write at the top must have exactly one "
+        "test below it, and every test must trace to a scenario. Say so "
+        "explicitly if a scenario in the story cannot be tested against this "
+        "code, and why.",
         "",
         "Do not invent files, classes, methods or APIs that are not in the "
         "attached code. If the fix needs something that is not there, say so "
@@ -393,7 +430,7 @@ def main():
     ap.add_argument("--max-total-mb", type=float, default=8.0)
     ap.add_argument("--ext")
     ap.add_argument("--exclude", action="append", default=[])
-    ap.add_argument("--tests", action="store_true")
+    ap.add_argument("--no-tests", action="store_true")
     ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--no-story", action="store_true")
     ap.add_argument("--no-clipboard", action="store_true")
