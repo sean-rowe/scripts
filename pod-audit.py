@@ -1086,30 +1086,37 @@ def wip_and_hygiene(per_dev, current_sprint, cfg):
 
 
 def build_agenda(per_dev, blocked_aging, accept_queue, waiting_reviews, wip_flags, cfg, out_today):
-    """The 'conversations to have today' list: (owner, text)."""
+    """The 'conversations to have today' list.
+
+    Each item records who should lead it (role), who it is WITH (dev) and
+    which story it is about (sid), because the report groups by developer
+    then story — you have one conversation with someone, not one per flag.
+    """
     r = cfg["risks"]
     agenda = []
+
+    def item(role, dev, sid, text):
+        agenda.append({"role": role, "dev": dev or "", "sid": sid or "", "text": text})
+
     for s, days in blocked_aging:
         if days >= r["blocked_escalate_days"]:
-            agenda.append(("Scrum master",
-                           f"Escalate {s.sid} — blocked {days}d: {s.blocked_reason or 'no reason recorded'}"))
-    for s, days in accept_queue:
-        if days >= r["acceptance_wait_days"]:
-            agenda.append(("PO", f"Accept or bounce {s.sid} — sitting Completed for {days}d"))
+            item("Scrum master", s.owner, s.sid,
+                 f"Escalate — blocked {days}d: {s.blocked_reason or 'no reason recorded'}")
     for s, pr, wait in waiting_reviews:
         if wait >= r["review_wait_days"]:
             who = ", ".join(pr.awaiting) or "no reviewer assigned"
-            agenda.append(("Tech lead", f"Get {s.sid} reviewed — PR open {wait}d ({who}): {pr.url}"))
+            item("Tech lead", s.owner, s.sid,
+                 f"Get it reviewed — PR open {wait}d ({who})")
     for dev, by_sprint in per_dev.items():
         if dev in out_today:
             continue
-        reds = [s for sp in by_sprint.values() for s in sp if s.lateness == "red" and not s.done]
-        if reds:
-            ids = ", ".join(s.sid for s in reds)
-            agenda.append(("Tech lead", f"Talk to {dev} — red: {ids}"))
+        reds = [s for sp in by_sprint.values() for s in sp
+                if s.lateness == "red" and not s.done]
+        for s in reds:
+            item("Tech lead", dev, s.sid, "Flagged red — agree a plan or cut scope")
     for dev, active in wip_flags:
-        agenda.append(("Scrum master",
-                       f"{dev} has {len(active)} stories In-Progress — help them finish one first"))
+        item("Scrum master", dev, "",
+             f"{len(active)} stories In-Progress at once — help them finish one first")
     return agenda
 
 
@@ -1503,29 +1510,39 @@ a:hover { color:var(--bad); }
 .agenda .body .mono { font-size:10pt; font-weight:600; }
 .agenda .link { font:400 8.5pt/1.3 var(--mono); margin-top:5pt; }
 
-/* Attention list: one block per story, its problems nested underneath, so
-   a troubled story reads as one thing to act on rather than as four
-   unrelated rows scattered across four cards. */
-.donelist { background:var(--tintg); padding:8pt 11pt 9pt; margin:0 0 26pt;
-            break-inside:avoid; font:400 9pt/1.5 var(--sans); color:var(--ink2); }
-.donelist .lbl { font:600 7.5pt/1 var(--mono); letter-spacing:.07em;
-                 text-transform:uppercase; color:var(--ok); margin-right:8pt; }
-.donelist .d { display:inline-block; margin-right:14pt; white-space:nowrap; }
-
-.attn { display:grid; gap:7pt; margin:11pt 0 30pt; }
-.attn-item { break-inside:avoid; background:var(--panel); padding:9pt 12pt 10pt;
+/* Conversations: developer -> story -> detail. The person is the outer
+   group because a conversation is with a person; their stories nest inside,
+   and each story's problems nest inside that. */
+.convo { display:grid; gap:9pt; margin:11pt 0 30pt; }
+.convo-dev { break-inside:avoid; background:var(--panel); padding:0 0 9pt;
              border-left:3pt solid var(--rule2); }
-.attn-item.bad { border-left-color:var(--bad); background:var(--tintr); }
-.attn-item.warn { border-left-color:var(--warnc); background:var(--tinta); }
-.attn-item .hd { font:400 10.5pt/1.35 var(--serif); margin-bottom:5pt; }
-.attn-item .hd .mono { font-size:10.5pt; font-weight:700; }
-.attn-item .hd .nm { font-weight:600; }
-.attn-item .row { display:grid; grid-template-columns:60pt 1fr; gap:7pt;
-                  font:400 9pt/1.4 var(--sans); color:var(--ink2); margin-top:3pt; }
-.attn-item .v { min-width:0; }
-.attn-item .k { font:600 7pt/1.5 var(--mono); letter-spacing:.05em;
-                text-transform:uppercase; color:var(--muted); text-align:right;
-                white-space:nowrap; overflow:hidden; }
+.convo-dev.bad { border-left-color:var(--bad); background:var(--tintr); }
+.convo-dev.warn { border-left-color:var(--warnc); background:var(--tinta); }
+.convo-dev .dvhd {
+  display:flex; align-items:baseline; gap:8pt;
+  font:700 12pt/1.25 var(--serif); letter-spacing:-.015em; color:var(--navy);
+  padding:9pt 13pt 7pt; border-bottom:.5pt solid var(--rule2); margin-bottom:2pt;
+}
+.convo-dev .dvhd .cnt { margin-left:auto; font:600 7.5pt/1 var(--mono);
+                        letter-spacing:.06em; text-transform:uppercase;
+                        color:var(--muted); }
+.convo-dev .outtag { font:600 7.5pt/1 var(--mono); letter-spacing:.06em;
+                     text-transform:uppercase; color:var(--warnc); }
+.convo-story { padding:6pt 13pt 2pt; break-inside:avoid; }
+.convo-story .sthd { font:400 10pt/1.35 var(--serif); margin-bottom:3pt; }
+.convo-story .sthd .mono { font-size:10pt; font-weight:700; }
+.convo-story .sthd .nm { font-weight:600; }
+.convo-story .role {
+  display:inline-block; margin-left:6pt; padding:2pt 5pt;
+  font:600 6.5pt/1 var(--mono); letter-spacing:.07em; text-transform:uppercase;
+  color:#FFFFFF; background:var(--accent); vertical-align:1.5pt;
+}
+.convo-story .row { display:grid; grid-template-columns:62pt 1fr; gap:7pt;
+                    font:400 9pt/1.4 var(--sans); color:var(--ink2); margin-top:3pt; }
+.convo-story .v { min-width:0; }
+.convo-story .k { font:600 7pt/1.5 var(--mono); letter-spacing:.05em;
+                  text-transform:uppercase; color:var(--muted); text-align:right;
+                  white-space:nowrap; overflow:hidden; }
 
 .flags { display:grid; grid-template-columns:1fr 1fr; gap:12pt; margin:11pt 0 30pt; }
 .flag { break-inside:avoid; background:var(--panel); border-left:3pt solid var(--rule2); padding:9pt 11pt 10pt; }
@@ -1640,6 +1657,16 @@ p, li { orphans:3; widows:3; }
 
 def esc(s):
     return html.escape(str(s))
+
+
+FINISHED_STATES = ("Completed", "Accepted", "Released")
+
+
+def is_finished(story):
+    """True for work nobody needs to act on. This report is about what is
+    NOT done yet, so Completed and Accepted stories are left out of the
+    per-dev cards entirely rather than shown with a status badge."""
+    return story.state in FINISHED_STATES or story.done
 
 
 def _lateness_class(story):
@@ -1885,9 +1912,9 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     failing = [(s, pr) for s, pr in open_prs if pr.checks_failed]
     body.append('<div class="tiles">')
     body.append(_tile("Remaining", f"{remaining:g}", f"of {total:g} pts"))
-    n_open = sum(1 for s in all_current if not s.done)
+    n_open = sum(1 for s in all_current if not is_finished(s))
     body.append(_tile("Stories open", f"{n_open}",
-                      f"of {len(all_current)}, {len(all_current) - n_open} accepted",
+                      f"of {len(all_current)}, {len(all_current) - n_open} finished",
                       tone="" if n_open else "good", tint="" if n_open else "g"))
     body.append(_tile("PRs open", f"{len(open_prs)}",
                       (f'<span class="risk">{len(unreviewed)} unreviewed</span>'
@@ -1906,30 +1933,29 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                       tint="a" if out_today else "g"))
     body.append("</div>")
 
-    body.append("<h2>Conversations to have today</h2>")
-    if analysis["agenda"]:
-        body.append('<div class="note">Routed to the owner who can move it. '
-                    'Items for absent devs are muted automatically.</div>')
-        body.append('<div class="agenda">')
-        for owner, text in analysis["agenda"]:
-            body.append(f'<div class="item"><div><div class="owner">{esc(owner)}</div></div>'
-                        f'<div class="body">{esc(text)}</div></div>')
-        body.append("</div>")
-    else:
-        body.append('<div class="note">Nothing needs an intervention this morning.</div>')
+    # Conversations to have today — grouped developer, then story, then the
+    # detail on that story. You have ONE conversation with a person covering
+    # everything of theirs, so the person is the outer group; a flat list
+    # routed by risk type made that impossible to see.
+    SEV = {"ask": 0, "blocked": 1, "failing": 2, "review": 3, "oversized": 4,
+           "acceptance": 5, "risk": 6, "hygiene": 7}
+    ROLE_OF = {}          # sid -> role that should lead, from the agenda
+    groups = {}           # dev -> {"stories": {sid: {...}}, "general": [...]}
 
-    # "Needs attention now", grouped BY STORY rather than by risk type.
-    # Grouping by type meant one troubled story was scattered across four
-    # cards and the reader had to rejoin them to see it was one conversation.
-    # Each story appears exactly once here, worst first, with every problem
-    # it has listed underneath it.
-    SEV = {"blocked": 0, "failing": 1, "review": 2, "oversized": 3,
-           "acceptance": 4, "risk": 5, "hygiene": 6}
-    trouble = {}
+    def group_for(dev):
+        return groups.setdefault(dev or "Unassigned",
+                                 {"stories": {}, "general": []})
 
-    def add(story, kind, text):
-        e = trouble.setdefault(story.sid, {"story": story, "items": []})
-        e["items"].append((SEV[kind], kind, text))
+    def add(story, kind, text, role=""):
+        g = group_for(story.owner)
+        e = g["stories"].setdefault(story.sid, {"story": story, "items": []})
+        e["items"].append((SEV[kind], kind, text, role))
+
+    for it in analysis["agenda"]:
+        if it["sid"]:
+            ROLE_OF.setdefault(it["sid"], it["role"])
+        else:
+            group_for(it["dev"])["general"].append((it["role"], it["text"]))
 
     for st, d in analysis["blocked_aging"]:
         add(st, "blocked", f'Blocked {d}d — {esc(st.blocked_reason or "no reason recorded")}'
@@ -1946,49 +1972,79 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     for st, pr in big:
         add(st, "oversized", f"Oversized PR: +{pr.additions}/−{pr.deletions} against a "
                              f'{risks_cfg["big_pr_lines"]}-line threshold')
-    for st, d in analysis["accept_queue"]:
-        add(st, "acceptance", f"Completed {d}d, still not accepted "
-                              f'<span class="muted">(PO agenda at '
-                              f'{risks_cfg["acceptance_wait_days"]}d)</span>')
     for st, (tag, msg) in all_risks:
-        if tag.lower() not in ("blocked", "stale-review"):   # already stated above
+        if tag.lower() not in ("blocked", "stale-review"):
             add(st, "risk", f'<span class="mono" style="font-size:8pt;font-weight:600">'
                             f"{esc(tag.upper())}</span> {esc(msg)}")
-    # Hygiene only joins a story that is already in trouble; a story whose
-    # ONLY problem is a missing estimate belongs in the cleanup panel, not
-    # in the list of things to act on this morning.
+    # The ask itself, from the agenda, sits at the top of its story.
+    for it in analysis["agenda"]:
+        if not it["sid"]:
+            continue
+        for g in groups.values():
+            if it["sid"] in g["stories"]:
+                g["stories"][it["sid"]]["items"].append(
+                    (SEV["ask"], "ask", esc(it["text"]), it["role"]))
+                break
+    # Hygiene only joins a story already being discussed; a story whose only
+    # problem is a missing estimate is a cleanup chore, not a conversation.
     hygiene_only = []
     for _dev, st, problem in analysis["hygiene"]:
-        if st.sid in trouble:
+        g = groups.get(st.owner or "Unassigned")
+        if g and st.sid in g["stories"]:
             add(st, "hygiene", esc(problem))
         else:
             hygiene_only.append((st, problem))
 
-    if trouble:
-        ranked = sorted(trouble.values(),
-                        key=lambda e: (min(i[0] for i in e["items"]),
-                                       -len(e["items"]), e["story"].sid))
-        body.append("<h2>Needs attention now</h2>")
-        body.append(f'<div class="note">{len(ranked)} stor'
-                    f'{"y" if len(ranked) == 1 else "ies"} need something from '
-                    "someone today, worst first. Every problem each one has is "
-                    "listed under it.</div>")
-        body.append('<div class="attn">')
-        for e in ranked:
-            st = e["story"]
-            worst = min(i[0] for i in e["items"])
+    def worst_of(entry):
+        return min(i[0] for i in entry["items"]) if entry["items"] else 99
+
+    ranked_devs = sorted(
+        groups.items(),
+        key=lambda kv: (min([worst_of(e) for e in kv[1]["stories"].values()] or [99]),
+                        -len(kv[1]["stories"]), kv[0]))
+
+    body.append("<h2>Conversations to have today</h2>")
+    if ranked_devs:
+        n_items = sum(len(e["items"]) for _d, g in ranked_devs
+                      for e in g["stories"].values()) \
+                  + sum(len(g["general"]) for _d, g in ranked_devs)
+        body.append(f'<div class="note">{len(ranked_devs)} '
+                    f'{"person" if len(ranked_devs) == 1 else "people"} to talk to, '
+                    f"{n_items} thing(s) to raise. One block per person: everything "
+                    "of theirs is here, worst first. Roles mark who should lead.</div>")
+        body.append('<div class="convo">')
+        for dev, g in ranked_devs:
+            worst = min([worst_of(e) for e in g["stories"].values()] or [99])
             tone = "bad" if worst <= SEV["failing"] else "warn"
-            rows = "".join(
-                f'<div class="row"><span class="k">{k}</span>'
-                f'<span class="v">{t}</span></div>'
-                for _sv, k, t in sorted(e["items"], key=lambda i: i[0]))
-            body.append(
-                f'<div class="attn-item {tone}">'
-                f'<div class="hd">{lat_dot(st)}'
-                f'<a class="mono" href="{esc(st.url)}">{esc(st.sid)}</a> '
-                f'<span class="nm">{esc(st.name)}</span>{_who(st)}</div>'
-                f"{rows}</div>")
+            out_tag = (' <span class="outtag">out today</span>'
+                       if dev in out_today else "")
+            unassigned = (' <span class="outtag" style="color:var(--bad)">'
+                          "nobody owns these</span>") if dev == "Unassigned" else ""
+            body.append(f'<div class="convo-dev {tone}">')
+            body.append(f'<div class="dvhd">{esc(dev)}{unassigned}{out_tag}'
+                        f'<span class="cnt">{len(g["stories"])} '
+                        f'stor{"y" if len(g["stories"]) == 1 else "ies"}</span></div>')
+            for _sid, e in sorted(g["stories"].items(), key=lambda kv: (
+                    worst_of(kv[1]), kv[0])):
+                st = e["story"]
+                role = ROLE_OF.get(st.sid, "")
+                badge = f'<span class="role">{esc(role)}</span>' if role else ""
+                body.append(f'<div class="convo-story"><div class="sthd">{lat_dot(st)}'
+                            f'<a class="mono" href="{esc(st.url)}">{esc(st.sid)}</a> '
+                            f'<span class="nm">{esc(st.name)}</span>{badge}</div>')
+                for _sv, kind, text, _role in sorted(e["items"], key=lambda i: i[0]):
+                    body.append(f'<div class="row"><span class="k">{kind}</span>'
+                                f'<span class="v">{text}</span></div>')
+                body.append("</div>")
+            for role, text in g["general"]:
+                body.append(f'<div class="convo-story"><div class="row">'
+                            f'<span class="k">{esc(role)}</span>'
+                            f'<span class="v">{esc(text)}</span></div></div>')
+            body.append("</div>")
         body.append("</div>")
+    else:
+        body.append('<div class="note">Nothing needs an intervention this '
+                    "morning.</div>")
 
     actions = analysis["actions"]
     if actions is not None and not actions.get("missing") and actions["open"]:
@@ -2169,7 +2225,7 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
         for n in sprints:
             stories = by_sprint.get(n, [])
             if n != current_sprint:
-                stories = [s for s in stories if not s.done]
+                stories = [s for s in stories if not is_finished(s)]
                 if not stories:
                     continue
                 body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
@@ -2180,26 +2236,16 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
                 if not stories:
                     body.append('<div class="line warn">No stories assigned in the '
                                 "current sprint.</div>")
-            # Accepted work is finished work: it gets one line, not a card.
-            # The cards are reserved for what is still in flight, worst first,
-            # which is what anyone reading this in the morning is here for.
-            open_stories = [x for x in stories if not x.done]
-            done_stories = [x for x in stories if x.done]
+            # Only work that is not done yet. Completed and Accepted
+            # stories are dropped, not summarised: this page exists to show
+            # what still needs something from someone.
+            open_stories = [x for x in stories if not is_finished(x)]
             for s in sorted(open_stories, key=lambda x: (
                     {"red": 0, "yellow": 1}.get(x.lateness, 2), not x.blocked, x.sid)):
                 body.append(render_story(s, n, current_sprint))
             if not open_stories and stories:
-                body.append('<div class="line good">Nothing open — everything '
-                            "assigned here is accepted.</div>")
-            if done_stories:
-                body.append(f'<div class="donelist"><span class="lbl">Accepted '
-                            f'· {len(done_stories)}</span>'
-                            + " ".join(
-                                f'<span class="d"><a class="mono" href="{esc(x.url)}">'
-                                f'{esc(x.sid)}</a> {esc(x.name)}'
-                                + (f" · {x.points:g} pts" if x.points is not None else "")
-                                + "</span>" for x in sorted(done_stories, key=lambda x: x.sid))
-                            + "</div>")
+                body.append('<div class="line good">Nothing outstanding — every '
+                            "story assigned here is finished.</div>")
 
         card = analysis["coaching"].get(dev)
         if card:
@@ -2409,8 +2455,10 @@ def print_summary(cfg, today, current_sprint, per_dev, report_path, pdf_path=Non
     print("=" * 62)
     if analysis and analysis.get("agenda"):
         print("\n Conversations to have today:")
-        for owner, text in analysis["agenda"]:
-            print(f"   [{owner}] {text}")
+        for it in analysis["agenda"]:
+            who = f" with {it['dev']}" if it["dev"] else ""
+            sid = f" {it['sid']}" if it["sid"] else ""
+            print(f"   [{it['role']}{who}]{sid} {it['text']}")
     for dev, by_sprint in per_dev.items():
         cur = by_sprint.get(current_sprint, [])
         everything = [s for sp in by_sprint.values() for s in sp]
