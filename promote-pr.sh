@@ -52,6 +52,11 @@
 #   --remote <name>       Git remote (default: origin)
 #   --release-prefix <p>  Release branch prefix (default: release-)
 #   --branch-name <name>  Override the generated work branch name
+#   --message <msg>       Merge-commit message for --from-release promotions
+#                         (default: "Merge release-NN into <target>"); use it
+#                         when a commit-msg hook demands a ticket-id format.
+#                         Also accepted with --continue to set the message
+#                         while finishing a conflicted merge.
 #   --no-pr               Skip opening the pull request
 #   --no-open             Don't open the created PR in the browser
 #   --keep-foreign-commits  Keep commits whose message references a Rally
@@ -87,6 +92,7 @@ CONTINUE_RUN=false
 ABORT_RUN=false
 FORCE_PUSH=false
 NO_VERIFY=false
+MSG_OVERRIDE=""
 
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -108,6 +114,7 @@ while [[ $# -gt 0 ]]; do
     --remote)         REMOTE="${2:-}"; shift 2 ;;
     --release-prefix) RELEASE_PREFIX="${2:-}"; shift 2 ;;
     --branch-name)    BRANCH_OVERRIDE="${2:-}"; shift 2 ;;
+    --message)        MSG_OVERRIDE="${2:-}"; shift 2 ;;
     --no-pr)          CREATE_PR=false; shift ;;
     --no-open)        OPEN_PR=false; shift ;;
     --keep-foreign-commits) KEEP_FOREIGN=true; shift ;;
@@ -471,7 +478,8 @@ if ! $CONTINUE_RUN; then
   if [[ "$MODE" == "merge" ]]; then
     save_state 0
     info "Merging '${REMOTE}/${FROM_BRANCH}' into '$NEW_BRANCH'..."
-    if ! MERGE_OUT=$(git merge --no-ff -m "Merge ${FROM_BRANCH} into ${TO_BRANCH}" "${REMOTE}/${FROM_BRANCH}" 2>&1); then
+    MERGE_MSG="${MSG_OVERRIDE:-Merge ${FROM_BRANCH} into ${TO_BRANCH}}"
+    if ! MERGE_OUT=$(git merge --no-ff -m "$MERGE_MSG" "${REMOTE}/${FROM_BRANCH}" 2>&1); then
       echo "$MERGE_OUT" >&2
       cat >&2 <<EOF
 
@@ -497,7 +505,14 @@ else
     git switch "$NEW_BRANCH"
   fi
 
-  COMMIT_ARGS=(--no-edit)
+  # A --message on this command line replaces the merge message; otherwise
+  # --no-edit reuses the one recorded when the merge was started.
+  COMMIT_ARGS=()
+  if [[ -n "$MSG_OVERRIDE" ]]; then
+    COMMIT_ARGS+=(-m "$MSG_OVERRIDE")
+  else
+    COMMIT_ARGS+=(--no-edit)
+  fi
   if $NO_VERIFY; then COMMIT_ARGS+=(--no-verify); fi
 
   if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
@@ -507,7 +522,9 @@ else
       echo "$FINISH_OUT" >&2
       echo "" >&2
       echo "'git commit' failed to finish the merge (its output is above)." >&2
-      echo "If a commit hook caused it, re-run with: $SCRIPT_NAME --continue --no-verify" >&2
+      echo "If a commit-message hook rejected it, re-run with a compliant message:" >&2
+      echo "    $SCRIPT_NAME --continue --message 'US123456: promote ${FROM_BRANCH:-release} to ${TO_BRANCH}'" >&2
+      echo "or skip hooks entirely with: $SCRIPT_NAME --continue --no-verify" >&2
       exit 1
     fi
   elif git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
