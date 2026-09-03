@@ -416,6 +416,7 @@ class Story:
     accepted: dt.date | None
     in_progress: dt.date | None
     acs: list
+    owner: str = ""     # Rally Owner display name ("" = unassigned in Rally)
     ac_scores: list = field(default_factory=list)   # [(percent, note)] per AC
     branches: list = field(default_factory=list)
     risks: list = field(default_factory=list)
@@ -474,6 +475,7 @@ def build_story(rally, kind, raw):
         accepted=_rally_date(raw.get("AcceptedDate")),
         in_progress=_rally_date(raw.get("InProgressDate")),
         acs=parse_acceptance_criteria(raw, rally.ac_field),
+        owner=str((raw.get("Owner") or {}).get("_refObjectName") or ""),
     )
 
 
@@ -1406,6 +1408,10 @@ ul.risks { margin:0; padding-left:18px; } ul.risks li { margin:5px 0; }
 .agenda li { margin:6px 0; }
 .owner { display:inline-block; min-width:96px; font-weight:700; color:var(--muted);
          font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
+.who { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
+       background:var(--bg); border:1px solid var(--line); color:var(--muted);
+       font-size:11px; font-weight:600; white-space:nowrap; }
+.who.unassigned { color:var(--bad); border-color:var(--bad); font-weight:700; }
 .scorebox { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
 .scorebox > div { background:var(--bg); border:1px solid var(--line); border-radius:8px;
                   padding:6px 12px; text-align:center; }
@@ -1421,6 +1427,16 @@ ul.risks { margin:0; padding-left:18px; } ul.risks li { margin:5px 0; }
 
 def esc(s):
     return html.escape(str(s))
+
+
+def story_ref(story):
+    """Story id + title + owner, for the risk lists that would otherwise show
+    a bare id. Every list entry must say who it belongs to."""
+    who = story.owner or "unassigned"
+    cls = "who" if story.owner else "who unassigned"
+    title = f" {esc(story.name)}" if story.name else ""
+    return (f'<a href="{esc(story.url)}">{esc(story.sid)}</a>{title} '
+            f'<span class="{cls}">{esc(who)}</span>')
 
 
 def state_badge(story):
@@ -1645,8 +1661,8 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
         for s, pr, wait in waiting:
             who = ", ".join(pr.awaiting) or "no reviewer assigned"
             cls = "risk" if wait >= cfg["risks"]["review_wait_days"] else ""
-            h.append(f'<li class="{cls}">{esc(s.sid)} — waiting {wait}d ({esc(who)}): '
-                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+            h.append(f'<li class="{cls}">{story_ref(s)} — waiting {wait}d, '
+                     f'reviewer: {esc(who)} · <a href="{esc(pr.url)}">PR</a></li>')
         h.append("</ul>")
     else:
         h.append('<div class="muted">No PRs waiting on review.</div>')
@@ -1655,16 +1671,16 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     if failing:
         h.append("<div><strong>Failing checks</strong></div><ul class='risks'>")
         for s, pr in failing:
-            h.append(f'<li class="risk">{esc(s.sid)} — {pr.checks_failed} failing: '
-                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+            h.append(f'<li class="risk">{story_ref(s)} — {pr.checks_failed} failing '
+                     f'· <a href="{esc(pr.url)}">PR</a></li>')
         h.append("</ul>")
     big = [(s, pr) for s in all_stories for pr in s.all_prs
            if pr.state == "OPEN" and (pr.additions + pr.deletions) > cfg["risks"]["big_pr_lines"]]
     if big:
         h.append("<div><strong>Oversized PRs</strong></div><ul class='risks'>")
         for s, pr in big:
-            h.append(f'<li class="warn">{esc(s.sid)} — +{pr.additions}/−{pr.deletions}: '
-                     f'<a href="{esc(pr.url)}">{esc(pr.title)}</a></li>')
+            h.append(f'<li class="warn">{story_ref(s)} — +{pr.additions}/−{pr.deletions} '
+                     f'· <a href="{esc(pr.url)}">PR</a></li>')
         h.append("</ul>")
     if analysis["review_load"]:
         load = sorted(analysis["review_load"].items(), key=lambda kv: -kv[1])
@@ -1676,14 +1692,14 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     if analysis["blocked_aging"]:
         h.append("<ul class='risks'>")
         for s, days in analysis["blocked_aging"]:
-            h.append(f'<li class="risk"><strong>{esc(s.sid)}</strong> blocked {days}d — '
+            h.append(f'<li class="risk">{story_ref(s)} — blocked {days}d: '
                      f"{esc(s.blocked_reason or 'no reason recorded')}</li>")
         h.append("</ul>")
     if analysis["accept_queue"]:
         h.append("<div><strong>Awaiting PO acceptance</strong></div><ul class='risks'>")
         for s, days in analysis["accept_queue"]:
             cls = "risk" if days >= cfg["risks"]["acceptance_wait_days"] else ""
-            h.append(f'<li class="{cls}">{esc(s.sid)} — Completed for {days}d</li>')
+            h.append(f'<li class="{cls}">{story_ref(s)} — Completed for {days}d</li>')
         h.append("</ul>")
     if not analysis["blocked_aging"] and not analysis["accept_queue"]:
         h.append('<div class="muted">Nothing blocked, nothing waiting on acceptance.</div>')
@@ -1694,7 +1710,7 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
         h.append("<h2>Scope change</h2><ul class='risks'>")
         for s in churn["added"]:
             pts = f"{s.points:g} pts" if s.points is not None else "unestimated"
-            h.append(f'<li class="warn">{esc(s.sid)} ({pts}) added after sprint start '
+            h.append(f'<li class="warn">{story_ref(s)} — {pts}, added after sprint start '
                      f'(baseline {esc(churn["baseline_date"])})</li>')
         h.append("</ul>")
 
@@ -1716,7 +1732,7 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     if analysis["hygiene"]:
         h.append("<h2>Data hygiene</h2><ul class='risks'>")
         for dev, s, problem in analysis["hygiene"]:
-            h.append(f'<li class="warn">{esc(s.sid)} ({esc(dev)}): {esc(problem)}</li>')
+            h.append(f'<li class="warn">{story_ref(s)} — {esc(problem)}</li>')
         h.append("</ul>")
 
     # --- Pod burndown: one chart per sprint, newest first, reconstructed
