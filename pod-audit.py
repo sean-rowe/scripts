@@ -1283,12 +1283,15 @@ def burndown_series(stories, start, cap):
 # Charts (inline SVG)
 # --------------------------------------------------------------------------
 
-def burndown_svg(title, length_days, total, actual, today_day=None, width=560, height=260):
-    """actual: [(day_index, remaining_points)]"""
-    ml, mr, mt, mb = 42, 14, 30, 30
+def burndown_svg(title, length_days, total, actual, today_day=None, width=640, height=300):
+    """A wider viewBox so labels land at ~8pt printed instead of ~5pt; the
+    remaining figure is labelled in words; the post-today region is shaded so
+    a flat line reads as flat; the title lives in HTML, not inside the SVG,
+    so it can wrap and stays selectable."""
+    ml, mr, mt, mb = 56, 24, 40, 44
     pw, ph = width - ml - mr, height - mt - mb
     y_max = max([total] + [v for _, v in actual] + [1])
-    last_day = length_days - 1
+    last_day = max(length_days - 1, 1)
 
     def x(day):
         return ml + pw * min(max(day, 0), last_day) / last_day
@@ -1296,132 +1299,318 @@ def burndown_svg(title, length_days, total, actual, today_day=None, width=560, h
     def y(val):
         return mt + ph * (1 - val / y_max)
 
-    parts = [
-        f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{html.escape(title)}">',
-        f'<text x="{ml}" y="18" class="ctitle">{html.escape(title)}</text>',
-    ]
-    # gridlines + y labels
+    p = [f'<svg viewBox="0 0 {width} {height}" class="chart" role="img" '
+         f'aria-label="{esc(title)}">']
+
     steps = 4
     for i in range(steps + 1):
         val = y_max * i / steps
         yy = y(val)
-        parts.append(f'<line x1="{ml}" y1="{yy:.1f}" x2="{width - mr}" y2="{yy:.1f}" class="grid"/>')
-        parts.append(f'<text x="{ml - 6}" y="{yy + 4:.1f}" class="ylab">{val:g}</text>')
-    # x labels: day 1..N (every other day to avoid crowding)
-    for d in range(0, length_days, 2):
-        parts.append(
-            f'<text x="{x(d):.1f}" y="{height - 8}" class="xlab">{d + 1}</text>'
-        )
-    # "today" marker
+        stroke = "#B7BCC2" if i == 0 else "#E3E7EB"
+        p.append(f'<line x1="{ml}" y1="{yy:.1f}" x2="{width - mr}" y2="{yy:.1f}" '
+                 f'stroke="{stroke}" stroke-width="1"/>')
+        if i in (0, steps // 2, steps):
+            p.append(f'<text x="{ml - 10}" y="{yy + 4:.1f}" text-anchor="end" '
+                     f'fill="#6B6C68" font-family="Geist Mono, monospace" '
+                     f'font-size="15">{val:g}</text>')
+
+    for d in (0, 4, 8, length_days - 1):
+        if 0 <= d <= last_day:
+            p.append(f'<text x="{x(d):.1f}" y="{height - 14}" text-anchor="middle" '
+                     f'fill="#6B6C68" font-family="Geist Mono, monospace" '
+                     f'font-size="15">{d + 1}</text>')
+
+    p.append(f'<line x1="{x(0):.1f}" y1="{y(total):.1f}" x2="{x(last_day):.1f}" '
+             f'y2="{y(0):.1f}" stroke="#6B6C68" stroke-width="1.6" stroke-dasharray="6 5"/>')
+
     show_today = today_day is not None and 0 <= today_day <= last_day
     if show_today:
         tx = x(today_day)
-        parts.append(f'<line x1="{tx:.1f}" y1="{mt}" x2="{tx:.1f}" y2="{mt + ph}" class="today"/>')
-    # ideal line
-    parts.append(
-        f'<line x1="{x(0):.1f}" y1="{y(total):.1f}" x2="{x(last_day):.1f}" y2="{y(0):.1f}" class="ideal"/>'
-    )
-    # actual line + points. The line is anchored at (day 0, sprint total) —
-    # true by definition — and dots mark only the days where remaining
-    # changed (i.e. work was accepted), plus the endpoint.
+        p.append(f'<rect x="{tx:.1f}" y="{mt - 6}" width="{width - mr - tx:.1f}" '
+                 f'height="{ph + 12}" fill="#14181D" opacity="0.035"/>')
+        p.append(f'<line x1="{tx:.1f}" y1="{mt - 6}" x2="{tx:.1f}" y2="{mt + ph + 6}" '
+                 f'stroke="#8A5A12" stroke-width="1.4" stroke-dasharray="3 3"/>')
+        p.append(f'<text x="{tx + 6:.1f}" y="{mt - 10}" fill="#8A5A12" '
+                 f'font-family="Geist Mono, monospace" font-size="14" '
+                 f'font-weight="600">today</text>')
+
     if actual:
         line = list(actual)
         if line[0][0] > 0:
             line.insert(0, (0, total))
+        remaining = actual[-1][1]
+        ideal_now = total * (1 - (today_day if today_day is not None else last_day) / last_day)
+        colour = "#2F6B4F" if remaining <= ideal_now else \
+                 ("#9B3327" if remaining > ideal_now + total * 0.3 else "#2B4E7E")
         pts = " ".join(f"{x(d):.1f},{y(v):.1f}" for d, v in line)
-        parts.append(f'<polyline points="{pts}" class="actual"/>')
-        dots = [
-            pt for i, pt in enumerate(actual)
-            if i == len(actual) - 1 or i == 0 or actual[i][1] != actual[i - 1][1]
-        ]
+        p.append(f'<polyline points="{pts}" fill="none" stroke="{colour}" stroke-width="3"/>')
+        dots = [pt for i, pt in enumerate(actual)
+                if i in (0, len(actual) - 1) or actual[i][1] != actual[i - 1][1]]
         for d, v in dots:
-            parts.append(f'<circle cx="{x(d):.1f}" cy="{y(v):.1f}" r="3" class="dot"/>')
-        label_y = max(y(actual[-1][1]) - 6, mt + 10)
-        parts.append(
-            f'<text x="{x(actual[-1][0]) + 6:.1f}" y="{label_y:.1f}" class="now">{actual[-1][1]:g}</text>'
-        )
-    today_leg = '&#160;&#160;<tspan class="todaylab">┊ today</tspan>' if show_today else ""
-    parts.append(
-        f'<text x="{width - mr}" y="18" text-anchor="end" class="legend">'
-        f'– – ideal &#160;&#160;● actual (pts remaining, by sprint day){today_leg}</text>'
-    )
-    parts.append("</svg>")
-    return "".join(parts)
+            p.append(f'<circle cx="{x(d):.1f}" cy="{y(v):.1f}" r="4.5" fill="{colour}"/>')
+        lx, ly = x(actual[-1][0]) + 12, max(y(remaining) - 6, mt + 12)
+        anchor = "start"
+        if lx > width - mr - 70:
+            lx, anchor = x(actual[-1][0]) - 12, "end"
+        p.append(f'<text x="{lx:.1f}" y="{ly:.1f}" text-anchor="{anchor}" fill="{colour}" '
+                 f'font-family="Geist Mono, monospace" font-size="17" '
+                 f'font-weight="600">{remaining:g} left</text>')
+
+    p.append("</svg>")
+    return "".join(p)
+
+
+def _chart_block(title, caption, svg):
+    return (f'<div><div class="ctitle">{title}</div>{svg}'
+            + (f'<div class="ccap">{caption}</div>' if caption else "")
+            + "</div>")
 
 
 # --------------------------------------------------------------------------
-# Report
+# HTML report
 # --------------------------------------------------------------------------
 
 CSS = """
-:root { --bg:#fff; --fg:#1a1d21; --muted:#667085; --line:#e4e7ec; --card:#f8fafc;
-        --ok:#12805c; --warnc:#b54708; --bad:#b42318; --accent:#175cd3; }
-@media (prefers-color-scheme: dark) {
-  :root { --bg:#101418; --fg:#e6e9ee; --muted:#98a2b3; --line:#2a313a; --card:#171d24;
-          --ok:#3ccb7f; --warnc:#f7b267; --bad:#f97066; --accent:#7cb3ff; } }
+@page { size: A4; margin: 13mm 14mm 13mm; }
+
+:root {
+  --paper:#FBFAF7; --ink:#14181D; --ink2:#3E4148; --muted:#5C5F66;
+  --faint:#6B6C68; --rule:#DCE0E5; --rule2:#B7BCC2; --panel:#F1F3F5;
+  --ok:#2F6B4F; --warnc:#8A5A12; --bad:#9B3327; --accent:#2B4E7E;
+  --navy:#1E3A5F; --gold:#F2B33D;
+  --tintb:#E9EEF6; --tintg:#E5EFE8; --tinta:#F8EFDB; --tintr:#F9E8E3;
+  --serif:"Manrope","Helvetica Neue",Helvetica,sans-serif;
+  --sans:"Instrument Sans","Helvetica Neue",Helvetica,Arial,sans-serif;
+  --mono:"Geist Mono",ui-monospace,"SFMono-Regular",Menlo,monospace;
+}
+
 * { box-sizing:border-box; }
-body { margin:0 auto; max-width:1100px; padding:24px; font:15px/1.5 -apple-system,
-       "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--fg); }
-h1 { font-size:24px; margin:0 0 4px; } h2 { font-size:19px; margin:32px 0 8px; }
-h3 { font-size:16px; margin:20px 0 6px; }
-.sub { color:var(--muted); margin-bottom:20px; }
-table { border-collapse:collapse; width:100%; margin:8px 0 16px; }
-th, td { text-align:left; padding:6px 10px; border-bottom:1px solid var(--line); }
-th { color:var(--muted); font-weight:600; font-size:13px; }
-td.num, th.num { text-align:right; }
-.card { background:var(--card); border:1px solid var(--line); border-radius:10px;
-        padding:16px 18px 18px; margin:14px 0; }
-.card .sec { margin-top:24px; }
-.seclab { font-size:11px; font-weight:700; text-transform:uppercase;
-          letter-spacing:.06em; color:var(--muted); margin-bottom:8px; }
-.prline { margin:6px 0 0 16px; }
-.badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px;
-         font-weight:600; border:1px solid var(--line); }
-.b-done { color:var(--ok); } .b-prog { color:var(--accent); } .b-blocked { color:var(--bad); }
-.risk { color:var(--bad); } .warn { color:var(--warnc); }
-.muted { color:var(--muted); } a { color:var(--accent); }
-.bar { background:var(--line); border-radius:4px; height:8px; width:160px;
-       display:inline-block; vertical-align:middle; }
-.bar > span { display:block; height:8px; border-radius:4px; background:var(--ok); }
-ul.acs { margin:0; padding-left:0; list-style:none; }
-ul.acs li { margin:6px 0; }
-ul.risks { margin:0; padding-left:18px; } ul.risks li { margin:5px 0; }
-.chart { max-width:100%; height:auto; }
-.chart .grid { stroke:var(--line); stroke-width:1; }
-.chart .ideal { stroke:var(--muted); stroke-width:1.5; stroke-dasharray:5 4; }
-.chart .actual { stroke:var(--accent); stroke-width:2.2; fill:none; }
-.chart .dot { fill:var(--accent); }
-.chart .ctitle { fill:var(--fg); font-size:13px; font-weight:600; }
-.chart .ylab { fill:var(--muted); font-size:10px; text-anchor:end; }
-.chart .xlab { fill:var(--muted); font-size:10px; text-anchor:middle; }
-.chart .now { fill:var(--accent); font-size:11px; font-weight:700; }
-.chart .legend { fill:var(--muted); font-size:10px; }
-.chart .today { stroke:var(--warnc); stroke-width:1; stroke-dasharray:2 3; }
-.chart .todaylab { fill:var(--warnc); font-size:10px; }
-.lat { display:inline-block; width:10px; height:10px; border-radius:50%; vertical-align:middle; }
+html { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+body {
+  margin:0 auto; max-width:186mm; padding:14mm 0;
+  background:var(--paper); color:var(--ink);
+  font:400 9.5pt/1.5 var(--sans);
+  text-wrap:pretty;
+}
+@media print { body { max-width:none; padding:0; } }
+
+/* Running header / footer frame. thead and tfoot repeat on every printed
+   page, which keeps body text from sliding under them. */
+table.frame { width:100%; table-layout:fixed; border-collapse:collapse; }
+.twocol > *, .flags > *, .charts > *, .tiles > * { min-width:0; }
+.wrapscroll { max-width:100%; overflow:hidden; }
+table.frame > thead > tr > td,
+table.frame > tbody > tr > td,
+table.frame > tfoot > tr > td { padding:0; border:0; }
+.runhead {
+  display:flex; justify-content:space-between; align-items:baseline;
+  font:600 8pt/1 var(--mono); letter-spacing:.09em; text-transform:uppercase;
+  color:var(--navy); border-bottom:2pt solid var(--accent);
+  padding-bottom:5pt; margin-bottom:11pt;
+}
+.runfoot {
+  display:flex; justify-content:space-between; align-items:baseline;
+  font:400 7.5pt/1 var(--mono); color:var(--faint);
+  border-top:.5pt solid var(--rule); padding-top:5pt; margin-top:11pt;
+}
+
+/* Headings ------------------------------------------------------------ */
+.masthead { background:var(--navy); padding:16pt 18pt 17pt; margin:0 0 22pt; break-inside:avoid; }
+.masthead h1 { color:#FFFFFF; margin:0 0 7pt; }
+.masthead .sub { color:#B9C9DD; margin:0 0 12pt; font-size:9.5pt; }
+.masthead .elapsed { margin:0; }
+.masthead .elapsed .track { background:#3A5C86; height:5pt; border-radius:0; }
+.masthead .elapsed .fill { background:var(--gold); height:5pt; }
+.masthead .elapsed .pct { color:var(--gold); }
+h1 { font:700 23pt/1.04 var(--serif); letter-spacing:-.02em; margin:0 0 6pt; }
+h2 {
+  font:700 12.5pt/1.2 var(--serif); letter-spacing:-.015em; margin:30pt 0 3pt;
+  color:var(--navy); padding-bottom:5pt; border-bottom:2pt solid var(--accent);
+  break-after:avoid;
+}
+h2:first-of-type { margin-top:10pt; }
+h3 { font:800 18pt/1.08 var(--serif); letter-spacing:-.025em; margin:0; }
+.seclab {
+  font:600 8pt/1 var(--mono); letter-spacing:.09em; text-transform:uppercase;
+  color:var(--navy); background:var(--tintb);
+  padding:6pt 8pt; margin:26pt 0 14pt; break-after:avoid;
+}
+.fieldlab {
+  font:600 7.5pt/1 var(--mono); letter-spacing:.07em; text-transform:uppercase;
+  color:var(--muted); margin-bottom:5pt;
+}
+.sub { font:400 10pt/1.45 var(--sans); color:var(--muted); margin:0 0 4pt; }
+.note { font:400 9pt/1.4 var(--sans); color:var(--faint); margin:7pt 0 10pt; }
+.mono { font-family:var(--mono); }
+.muted { color:var(--faint); } .risk { color:var(--bad); }
+.warn { color:var(--warnc); } .good { color:var(--ok); }
+a { color:var(--accent); text-decoration:none; }
+a:hover { color:var(--bad); }
+
+/* Owner attribution — every flagged line says whose it is. */
+.who {
+  display:inline-block; font:600 7pt/1 var(--mono); letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); background:#FFFFFF;
+  border:.5pt solid var(--rule2); padding:2pt 4pt; margin-left:3pt;
+  white-space:nowrap; vertical-align:1pt;
+}
+.who.unassigned { color:var(--bad); border-color:var(--bad); }
+
+/* Page-1 furniture ---------------------------------------------------- */
+.elapsed { display:flex; align-items:center; gap:8pt; margin:0 0 16pt; }
+.elapsed .track { flex:1; height:4pt; background:#E3E7EB; border-radius:2pt; overflow:hidden; }
+.elapsed .fill { height:4pt; background:var(--ink); }
+.elapsed .pct { font:600 8pt/1 var(--mono); letter-spacing:.06em; color:var(--muted); }
+
+.read {
+  break-inside:avoid; background:var(--tintr); border-left:4pt solid var(--bad);
+  padding:12pt 15pt 14pt; margin:0 0 26pt;
+}
+.read .kicker {
+  font:600 8pt/1 var(--mono); letter-spacing:.11em; text-transform:uppercase;
+  color:var(--bad); margin-bottom:6pt;
+}
+.read p { font:400 12pt/1.45 var(--serif); margin:0; orphans:3; widows:3; }
+.read .mono { font-size:12pt; }
+
+.tiles {
+  display:grid; grid-template-columns:repeat(6,1fr); gap:5pt;
+  margin:0 0 30pt; break-inside:avoid;
+}
+.tile { background:var(--tintb); padding:10pt 10pt 11pt; }
+.tile.g { background:var(--tintg); } .tile.a { background:var(--tinta); }
+.tile.r { background:var(--tintr); }
+.tile .lbl {
+  font:600 7.5pt/1 var(--mono); letter-spacing:.07em; text-transform:uppercase;
+  color:#5F6B7A; margin-bottom:5pt;
+}
+.tile .num { font:700 19pt/1 var(--serif); letter-spacing:-.02em; }
+.tile .foot { font:400 7.5pt/1.3 var(--sans); color:var(--faint); margin-top:3pt; }
+
+.agenda { display:grid; gap:5pt; margin:11pt 0 30pt; }
+.agenda .item {
+  background:var(--tintb); display:grid; grid-template-columns:74pt 1fr;
+  gap:12pt; padding:12pt 14pt; break-inside:avoid;
+}
+.agenda .owner {
+  display:inline-block; font:600 7.5pt/1 var(--mono); letter-spacing:.08em;
+  text-transform:uppercase; color:#FFFFFF; background:var(--accent); padding:4pt 6pt;
+}
+.agenda .who { font:400 7.5pt/1.3 var(--mono); color:var(--faint); margin-top:4pt;
+               display:block; background:none; border:0; padding:0; margin-left:0;
+               text-transform:none; letter-spacing:0; }
+.agenda .body { font:400 10.5pt/1.42 var(--serif); orphans:3; widows:3; }
+.agenda .body .mono { font-size:10pt; font-weight:600; }
+.agenda .link { font:400 8.5pt/1.3 var(--mono); margin-top:5pt; }
+
+.flags { display:grid; grid-template-columns:1fr 1fr; gap:12pt; margin:11pt 0 30pt; }
+.flag { break-inside:avoid; background:var(--panel); border-left:3pt solid var(--rule2); padding:9pt 11pt 10pt; }
+.flag.bad { border-left-color:var(--bad); background:var(--tintr); }
+.flag.warn { border-left-color:var(--warnc); background:var(--tinta); }
+.flag .lbl {
+  font:600 8pt/1 var(--mono); letter-spacing:.08em; text-transform:uppercase;
+  margin-bottom:6pt;
+}
+.flag.bad .lbl { color:var(--bad); } .flag.warn .lbl { color:var(--warnc); }
+.flag .body { font:400 9.5pt/1.4 var(--sans); }
+.flag .row { margin-bottom:4pt; }
+.flag .row:last-child { margin-bottom:0; }
+
+.twocol { display:grid; grid-template-columns:1fr 1fr; gap:22pt; margin-bottom:30pt; }
+.digest { list-style:none; margin:9pt 0 0; padding:0; color:var(--ink2); }
+.digest li { display:grid; grid-template-columns:9pt 1fr; gap:5pt; margin-bottom:5pt; break-inside:avoid; }
+.digest .g { color:var(--ok); font-weight:700; }
+.digest .b { color:var(--accent); font-weight:700; }
+.plainlist { list-style:none; margin:9pt 0 0; padding:0; color:var(--ink2); }
+.plainlist li { font:400 9.5pt/1.45 var(--sans); margin-bottom:5pt; break-inside:avoid; }
+
+.spread { display:flex; gap:2pt; margin:11pt 0 8pt; }
+.spread > div { height:16pt; }
+.key { display:flex; gap:14pt; font:400 8.5pt/1.4 var(--sans); color:var(--ink2); }
+.sw { display:inline-block; width:7pt; height:7pt; margin-right:4pt; }
+
+/* Tables -------------------------------------------------------------- */
+table.data { width:100%; border-collapse:collapse; margin:10pt 0 30pt; font:400 9.5pt/1.35 var(--sans); }
+table.data th {
+  text-align:left; padding:5pt 8pt 5pt 6pt; background:var(--tintb);
+  border-bottom:1.5pt solid var(--accent);
+  font:600 7.5pt/1.2 var(--mono); letter-spacing:.06em; text-transform:uppercase;
+  color:var(--navy);
+}
+table.data td { padding:7pt 8pt 7pt 0; border-bottom:.5pt solid var(--rule); }
+table.data tr { break-inside:avoid; }
+table.data .num, table.data th.num { text-align:right; padding-left:8pt; padding-right:0; font-family:var(--mono); }
+table.data tfoot td, table.data tfoot th {
+  background:var(--tintb); border-top:.5pt solid var(--accent);
+  border-bottom:1.5pt solid var(--navy); font-weight:700;
+}
+table.matrix td, table.matrix th { text-align:center; font-family:var(--mono); font-size:9pt; }
+table.matrix th { padding:5pt 2pt; font-size:6.5pt; letter-spacing:.02em; word-break:break-all; }
+table.matrix td { padding:6pt 2pt; }
+table.matrix td:first-child, table.matrix th:first-child { text-align:left; }
+.m-merged { color:var(--ok); font-weight:700; }
+.m-open { color:var(--accent); font-weight:600; }
+.m-declined { color:var(--bad); font-weight:700; }
+.m-none { color:var(--rule2); }
+.lat { display:inline-block; width:7pt; height:7pt; margin-right:5pt; vertical-align:middle; }
 .lat-green { background:var(--ok); } .lat-yellow { background:var(--warnc); }
 .lat-red { background:var(--bad); }
-.matrix td, .matrix th { text-align:center; }
-.matrix td:first-child, .matrix th:first-child { text-align:left; }
-.m-merged { color:var(--ok); font-weight:700; } .m-open { color:var(--accent); }
-.m-declined { color:var(--bad); } .m-none { color:var(--line); }
-.agenda li { margin:6px 0; }
-.owner { display:inline-block; min-width:96px; font-weight:700; color:var(--muted);
-         font-size:12px; text-transform:uppercase; letter-spacing:.05em; }
-.who { display:inline-block; margin-left:6px; padding:1px 7px; border-radius:10px;
-       background:var(--bg); border:1px solid var(--line); color:var(--muted);
-       font-size:11px; font-weight:600; white-space:nowrap; }
-.who.unassigned { color:var(--bad); border-color:var(--bad); font-weight:700; }
-.scorebox { display:flex; gap:10px; flex-wrap:wrap; margin:8px 0; }
-.scorebox > div { background:var(--bg); border:1px solid var(--line); border-radius:8px;
-                  padding:6px 12px; text-align:center; }
-.scorebox .num { font-size:20px; font-weight:700; } .scorebox .lbl { font-size:11px;
-                  color:var(--muted); text-transform:uppercase; letter-spacing:.05em; }
-.good { color:var(--ok); }
-.snippet { font-size:13px; color:var(--muted); margin:4px 0 4px 16px; }
-.snippet b { color:var(--fg); }
-.charts { display:flex; flex-wrap:wrap; gap:16px; }
-.charts > div { flex:1 1 460px; }
+
+/* Per-dev pages ------------------------------------------------------- */
+.dev { break-before:page; margin-top:44pt; padding-top:4pt; }
+.devhead {
+  display:flex; justify-content:space-between; align-items:flex-end;
+  border-bottom:2.5pt solid var(--accent); padding-bottom:6pt; margin-bottom:4pt;
+  break-after:avoid;
+}
+.devhead .stat { font:600 8pt/1 var(--mono); letter-spacing:.07em; text-transform:uppercase; }
+.quotes {
+  background:var(--tinta); border-left:3pt solid var(--warnc);
+  padding:11pt 14pt; margin-bottom:26pt; break-inside:avoid;
+}
+.quotes .q { font:400 9.5pt/1.5 var(--serif); margin-bottom:7pt; }
+.quotes .q:last-child { margin-bottom:0; }
+.quotes .src { font:400 8pt/1 var(--mono); color:var(--faint); }
+
+.scorebox { display:flex; gap:8pt; flex-wrap:wrap; margin:10pt 0 12pt; break-inside:avoid; }
+.scorebox > div { border:.5pt solid var(--rule); padding:6pt 12pt; text-align:center; }
+.scorebox .num { font:700 16pt/1 var(--serif); letter-spacing:-.02em; }
+.scorebox .lbl { font:600 7pt/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; color:var(--muted); margin-top:3pt; }
+
+.charts { display:grid; grid-template-columns:1fr 1fr; gap:16pt; margin-bottom:28pt; }
+.charts > div { break-inside:avoid; background:var(--panel); padding:10pt 11pt 11pt; }
+.charts .ctitle { font:600 9.5pt/1 var(--sans); color:var(--navy); margin-bottom:6pt; }
+.charts .ccap { font:400 8.5pt/1.4 var(--sans); color:var(--faint); margin-top:4pt; }
+.ccap { font:400 8.5pt/1.4 var(--sans); color:var(--faint); }
+svg.chart { width:100%; height:auto; display:block; }
+
+/* Story cards --------------------------------------------------------- */
+.card {
+  break-inside:avoid; margin-bottom:26pt; padding:11pt 13pt 13pt;
+  background:var(--panel); border-left:3pt solid var(--rule2);
+}
+.card.green { border-left-color:var(--ok); background:var(--tintg); }
+.card.yellow { border-left-color:var(--warnc); background:var(--tinta); }
+.card.red { border-left-color:var(--bad); background:var(--tintr); }
+.card .top { display:flex; justify-content:space-between; align-items:baseline; gap:10pt; }
+.card .title { font:700 11pt/1.3 var(--serif); letter-spacing:-.012em; }
+.card .title .mono { font-size:11pt; }
+.card .state { font:600 7.5pt/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+.card .meta { font:400 8.5pt/1.4 var(--mono); color:var(--faint); margin:4pt 0 8pt; }
+.card .cols { display:grid; grid-template-columns:1fr 1fr; gap:14pt; }
+.card .line { font:400 9.5pt/1.45 var(--sans); color:var(--ink2); }
+.card .tiny { font:400 8pt/1.4 var(--sans); color:var(--faint); margin-top:5pt; }
+.acs { list-style:none; margin:0; padding:0; }
+.acs li { font:400 9.5pt/1.4 var(--sans); color:var(--ink2); margin-bottom:4pt; break-inside:avoid; }
+.acs .pct { display:inline-block; width:30pt; font:600 8.5pt/1 var(--mono); }
+.pct { font:600 8.5pt/1 var(--mono); }
+.branch { font:400 8.5pt/1.45 var(--mono); }
+
+.colophon {
+  margin-top:34pt; padding-top:10pt; border-top:2pt solid var(--accent);
+  font:400 8pt/1.5 var(--mono); color:var(--faint); break-inside:avoid;
+}
+p, li { orphans:3; widows:3; }
 """
 
 
@@ -1429,127 +1618,163 @@ def esc(s):
     return html.escape(str(s))
 
 
-def story_ref(story):
-    """Story id + title + owner, for the risk lists that would otherwise show
-    a bare id. Every list entry must say who it belongs to."""
-    who = story.owner or "unassigned"
-    cls = "who" if story.owner else "who unassigned"
-    title = f" {esc(story.name)}" if story.name else ""
-    return (f'<a href="{esc(story.url)}">{esc(story.sid)}</a>{title} '
-            f'<span class="{cls}">{esc(who)}</span>')
+def _lateness_class(story):
+    return story.lateness or "green"
 
 
-def state_badge(story):
-    cls = "b-done" if story.done else ("b-blocked" if story.blocked else "b-prog")
-    label = story.state + (" · BLOCKED" if story.blocked else "")
-    return f'<span class="badge {cls}">{esc(label)}</span>'
-
-
-def pct_bar(pct):
-    color = "var(--ok)" if pct >= 70 else ("var(--warnc)" if pct >= 30 else "var(--bad)")
-    return (
-        f'<span class="bar"><span style="width:{pct}%;background:{color}"></span></span> '
-        f"<strong>{pct}%</strong>"
-    )
+def _pct_class(pct):
+    return "good" if pct >= 70 else ("warn" if pct >= 30 else "risk")
 
 
 def lat_dot(story):
-    return f'<span class="lat lat-{story.lateness or "green"}" title="{story.lateness}"></span>'
+    return f'<span class="lat lat-{_lateness_class(story)}" title="{esc(story.lateness)}"></span>'
+
+
+def pct_bar(pct):
+    """Percentages read as figures, not decorative bars: thirty of them down a
+    printed page was noise, and a bar's fill is unreadable at 4pt."""
+    return f'<span class="pct {_pct_class(pct)}">{pct}%</span>'
+
+
+def state_badge(story):
+    cls = "good" if story.done else ("risk" if story.blocked else "m-open")
+    label = story.state + (" · blocked" if story.blocked else "")
+    return f'<span class="state {cls}">{esc(label)}</span>'
+
+
+def _tile(label, value, foot="", tone="", tint=""):
+    """tone colours the figure; tint colours the card (g/a/r, default blue)."""
+    cls = f" {tone}" if tone else ""
+    tcls = f" {tint}" if tint else ""
+    return (f'<div class="tile{tcls}"><div class="lbl">{esc(label)}</div>'
+            f'<div class="num{cls}">{value}</div>'
+            f'<div class="foot">{foot}</div></div>')
+
+
+def _flag(label, count, rows, tone="bad"):
+    body = "".join(f'<div class="row">{r}</div>' for r in rows)
+    return (f'<div class="flag {tone}"><div class="lbl">{esc(label)} · {count}</div>'
+            f'<div class="body">{body}</div></div>')
+
+
+def _sid(sid):
+    return f'<span class="mono" style="font-weight:600">{esc(sid)}</span>'
+
+
+def _who(story):
+    """The owner chip. Every flagged line must say whose story it is —
+    an unowned story is a finding, not a blank."""
+    who = story.owner or "unassigned"
+    cls = "who" if story.owner else "who unassigned"
+    return f'<span class="{cls}">{esc(who)}</span>'
+
+
+def _sid_who(story):
+    return f"{_sid(story.sid)} {_who(story)}"
+
+
+def iteration_name_short(n):
+    return f"Sprint {n}"
 
 
 def render_story(story, sprint_n, current_sprint):
-    h = [f'<div class="card">']
+    """Two columns: what was promised (acceptance criteria) on the left, what
+    exists (branch, PR, risks) on the right. The old single column of labelled
+    stripes is why a story could split across a page break."""
     pts = f"{story.points:g} pts" if story.points is not None else "unestimated"
+    h = [f'<div class="card {_lateness_class(story)}">']
     h.append(
-        f'<div>{lat_dot(story)} <a href="{esc(story.url)}"><strong>{esc(story.sid)}</strong></a> '
-        f"{esc(story.name)} &nbsp;{state_badge(story)} "
-        f'<span class="muted">· {esc(story.kind)} · {pts} · '
-        f"{story.discussions} discussion(s)</span></div>"
+        '<div class="top">'
+        f'<div class="title"><a class="mono" href="{esc(story.url)}">{esc(story.sid)}</a> '
+        f"&nbsp;{esc(story.name)}</div>"
+        f'<div class="state {"risk" if story.blocked else ("good" if story.done else "m-open")}">'
+        f'{esc(story.state)}{" · blocked" if story.blocked else ""}</div></div>'
     )
-    h.append(f'<div class="sec">Overall completion: {pct_bar(story.completion)}</div>')
+    h.append(f'<div class="meta">{esc(story.kind)} · {esc(story.owner or "unassigned")} · '
+             f"{pts} · {story.discussions} discussion(s) · {story.completion}% complete · "
+             f"{esc(iteration_name_short(sprint_n))}</div>")
 
-    h.append('<div class="sec"><div class="seclab">Acceptance criteria</div>')
+    h.append('<div class="cols"><div>')
+    h.append(f'<div class="fieldlab">Acceptance criteria — {len(story.acs)}</div>')
     if story.acs:
-        h.append("<ul class='acs'>")
+        h.append('<ul class="acs">')
         for i, ac in enumerate(story.acs):
             if story.ac_scores:
                 pct, note = story.ac_scores[i]
-                note_html = f' <span class="muted">— {esc(note)}</span>' if note else ""
             else:
-                pct, note_html = story.completion, ' <span class="muted">— story-level estimate</span>'
+                pct, note = story.completion, ""
             tested = ""
             if story.ac_tested:
-                tested = (' <span class="good" title="tested behaviorally">✓ tested</span>'
-                          if story.ac_tested[i]
-                          else ' <span class="risk" title="no behavioral test found">✗ untested</span>')
-            h.append(f"<li>{pct_bar(pct)} {esc(ac)}{tested}{note_html}</li>")
+                tested = (' <span class="good">✓ tested</span>' if story.ac_tested[i]
+                          else ' <span class="risk">✗ untested</span>')
+            note_html = f' <span class="muted">— {esc(note)}</span>' if note else ""
+            h.append(f'<li><span class="pct {_pct_class(pct)}">{pct}%</span>'
+                     f"{esc(ac)}{tested}{note_html}</li>")
         h.append("</ul>")
+        if not story.ac_scores:
+            h.append('<div class="tiny">Story-level estimate — enable '
+                     '<span class="mono">[ai]</span> for per-criterion scoring.</div>')
     else:
-        h.append('<div class="warn">None found on the story.</div>')
-    h.append("</div>")
-
-    if story.tests_style or story.coverage_note or story.arch_note or story.ai_concerns:
-        h.append('<div class="sec"><div class="seclab">Code &amp; test assessment</div>')
+        h.append('<div class="line warn">None recorded on the story.</div>')
+    if story.tests_style or story.coverage_note or story.arch_note:
+        h.append('<div class="tiny">')
         if story.tests_style:
-            cls = "good" if story.tests_style == "behavioral" else \
-                  ("risk" if story.tests_style in ("implementation", "none") else "warn")
-            h.append(f'<div>Tests: <span class="{cls}">{esc(story.tests_style)}</span>'
-                     + (f' · coverage: {esc(story.coverage_note)}' if story.coverage_note else "")
-                     + "</div>")
+            cls = _pct_class(100 if story.tests_style == "behavioral" else 0)
+            h.append(f'Tests: <span class="{cls}">{esc(story.tests_style)}</span>')
+            if story.coverage_note:
+                h.append(f" · coverage: {esc(story.coverage_note)}")
         if story.arch_note:
-            h.append(f"<div>Architecture: {esc(story.arch_note)}</div>")
-        for c in story.ai_concerns:
-            h.append(f'<div class="warn">⚠ {esc(c)}</div>')
+            h.append(f"<br>Architecture: {esc(story.arch_note)}")
         h.append("</div>")
+    h.append("</div><div>")
 
-    h.append('<div class="sec"><div class="seclab">Branch &amp; pull requests</div>')
+    h.append('<div class="fieldlab">Branch, PR &amp; risks</div>')
     if story.branches:
         for b in story.branches:
-            age = (
-                f"last commit {b.last_commit_age_days}d ago"
-                if b.last_commit_age_days is not None
-                else "no commits"
-            )
-            h.append(
-                f'<div><code>{esc(b.repo)}:{esc(b.name)}</code> '
-                f'<span class="muted">— {b.commits} commit(s), {b.files_changed} file(s) '
-                f"changed (+{b.insertions}/−{b.deletions}), {age}"
-                + (f" · “{esc(b.last_commit_subject)}”" if b.last_commit_subject else "")
-                + "</span></div>"
-            )
+            age = (f"last commit {b.last_commit_age_days}d ago"
+                   if b.last_commit_age_days is not None else "no commits")
+            h.append(f'<div class="branch">{esc(b.repo)}:{esc(b.name)}</div>')
+            h.append(f'<div class="tiny" style="margin-top:0">{b.commits} commit(s) · '
+                     f"{b.files_changed} file(s) · +{b.insertions}/−{b.deletions} · {age}"
+                     + (f" — “{esc(b.last_commit_subject)}”" if b.last_commit_subject else "")
+                     + "</div>")
             for pr in b.prs:
-                extra = " · DRAFT" if pr.draft else ""
-                review = f" · {esc(pr.review)}" if pr.review else ""
-                size = f" · +{pr.additions}/−{pr.deletions}" if (pr.additions or pr.deletions) else ""
-                checks = ""
+                bits = [f'PR → <span class="mono">{esc(pr.base or "?")}</span>', esc(pr.state)]
+                if pr.draft:
+                    bits.append("draft")
+                if pr.review:
+                    bits.append(f'<span class="risk">{esc(pr.review.lower().replace("_", " "))}</span>')
+                if pr.additions or pr.deletions:
+                    bits.append(f"+{pr.additions}/−{pr.deletions}")
+                bits.append(f"{pr.comments} comment(s)")
                 if pr.checks_total:
                     if pr.checks_failed:
-                        checks = f' · <span class="risk">{pr.checks_failed} check(s) failing</span>'
+                        bits.append(f'<span class="risk">{pr.checks_failed} check(s) failing</span>')
                     elif pr.checks_pending:
-                        checks = f' · <span class="warn">{pr.checks_pending} check(s) pending</span>'
+                        bits.append(f'<span class="warn">{pr.checks_pending} check(s) pending</span>')
                     else:
-                        checks = ' · <span class="good">checks green</span>'
-                h.append(
-                    f'<div class="prline"><strong>PR → {esc(pr.base or "?")}</strong> '
-                    f'<a href="{esc(pr.url)}">{esc(pr.title)}</a> '
-                    f'<span class="muted">— {esc(pr.state)}{extra}{review}{size} · '
-                    f"{pr.comments} comment(s) · opened {esc(pr.created)}, "
-                    f"updated {esc(pr.updated)}</span>{checks}</div>"
-                )
+                        bits.append('<span class="good">checks green</span>')
+                h.append('<div class="line" style="margin-top:4pt">'
+                         + " · ".join(bits) + "</div>")
+                h.append(f'<div class="tiny" style="margin-top:0">'
+                         f'<a href="{esc(pr.url)}">{esc(pr.title)}</a> — opened '
+                         f"{esc(pr.created)}, updated {esc(pr.updated)}</div>")
         if not story.all_prs and not story.done:
-            h.append('<div class="warn">Branch exists but no PR raised yet.</div>')
+            h.append('<div class="line warn">Branch exists but no PR raised yet.</div>')
     elif story.done:
-        h.append('<div class="muted">No branch found.</div>')
+        h.append('<div class="line">No branch found — accepted in Rally with nothing '
+                 'in the configured repos. Worth checking the branch naming.</div>')
     else:
-        h.append('<div class="warn">No branch found for this story.</div>')
-    h.append("</div>")
+        h.append('<div class="line warn">No branch found for this story.</div>')
 
-    if story.risks:
-        h.append('<div class="sec"><div class="seclab">Risks</div><ul class="risks">')
-        for tag, msg in story.risks:
-            h.append(f'<li class="risk">[{esc(tag)}] {esc(msg)}</li>')
-        h.append("</ul></div>")
-    h.append("</div>")
+    for tag, msg in story.risks:
+        h.append(f'<div class="line risk" style="margin-top:3pt">'
+                 f'<span class="mono" style="font-size:8pt;font-weight:600">'
+                 f'{esc(tag.upper())}</span> {esc(msg)}</div>')
+    for c in story.ai_concerns:
+        h.append(f'<div class="line warn" style="margin-top:3pt">⚠ {esc(c)}</div>')
+
+    h.append("</div></div></div>")
     return "".join(h)
 
 
@@ -1557,9 +1782,44 @@ MATRIX_SYMBOL = {"merged": ("✓", "m-merged"), "open": ("●", "m-open"),
                  "declined": ("✗", "m-declined"), "-": ("—", "m-none")}
 
 
+def headline(cfg, today, current_sprint, per_dev, analysis, all_current, all_stories):
+    """The one-line read at the top of page 1: derived, not decorative."""
+    start, end = sprint_window(cfg, current_sprint)
+    length = cfg["sprint"]["length_days"]
+    elapsed = max(0, min(1, ((today - start).days + 1) / length))
+    total = total_points(all_current)
+    remaining = remaining_points(all_current)
+    ideal = total * (1 - elapsed)
+    days_left = max(0, (end - today).days)
+
+    worst = {}
+    for s in all_stories:
+        for tag, _ in s.risks:
+            worst.setdefault(s.sid, 0)
+            worst[s.sid] += 1
+    hot = sorted(worst.items(), key=lambda kv: -kv[1])[:2]
+
+    if remaining <= ideal:
+        verdict = (f"The pod is on or ahead of the line with <strong>{remaining:g} of "
+                   f"{total:g} points</strong> left and {days_left} days to go")
+    else:
+        verdict = (f"The pod is <strong>{remaining - ideal:.0f} points behind the line</strong> "
+                   f"with {remaining:g} of {total:g} left and {days_left} days to go")
+
+    if hot:
+        names = " and ".join(f'<span class="mono">{esc(sid)}</span>' for sid, _ in hot)
+        verdict += f", and today's risks concentrate on {names}"
+    out = analysis["out_today"]
+    if out:
+        verdict += (f". {esc(', '.join(sorted(out)))} "
+                    f"{'is' if len(out) == 1 else 'are'} out")
+    return verdict + "."
+
+
 def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     pod = cfg["pod"]["name"]
     length = cfg["sprint"]["length_days"]
+    risks_cfg = cfg["risks"]
     start, end = sprint_window(cfg, current_sprint)
     day_no = (today - start).days + 1
     it_name = iteration_name(cfg, current_sprint)
@@ -1568,271 +1828,370 @@ def render_report(cfg, today, current_sprint, sprints, per_dev, analysis):
     all_stories = [s for dev in per_dev.values() for sp in dev.values() for s in sp]
     all_risks = [(s, r) for s in all_stories for r in s.risks]
     blocked = [s for s in all_stories if s.blocked]
+    open_prs = [(s, pr) for s in all_stories for pr in s.all_prs if pr.state == "OPEN"]
     out_today = analysis["out_today"]
+    total, remaining = total_points(all_current), remaining_points(all_current)
 
-    out_note = f" · out today: {esc(', '.join(sorted(out_today)))}" if out_today else ""
-    h = [
-        f"<title>{esc(pod)} audit {today.isoformat()}</title>",
-        f"<style>{CSS}</style>",
-        f"<h1>{esc(pod)} — morning report</h1>",
+    green = sum(1 for s in all_stories if s.lateness == "green")
+    yellow = sum(1 for s in all_stories if s.lateness == "yellow")
+    red = sum(1 for s in all_stories if s.lateness == "red")
+
+    body = []
+
+    # ---- Page 1: the dashboard -------------------------------------------
+    body.append('<div class="masthead">')
+    body.append(f"<h1>{esc(pod)} — morning report</h1>")
+    body.append(
         f'<div class="sub">{today.strftime("%A %d %B %Y")} · {esc(it_name)} '
         f"({start.isoformat()} → {end.isoformat()}) · day {day_no} of {length} · "
-        f"includes {len(sprints) - 1} previous sprint(s){out_note}</div>",
-    ]
+        f"{len(sprints) - 1} previous sprint(s) in scope</div>"
+    )
+    pct_elapsed = round(100 * day_no / length)
+    body.append(f'<div class="elapsed"><div class="track">'
+                f'<div class="fill" style="width:{pct_elapsed}%"></div></div>'
+                f'<span class="pct">{pct_elapsed}% ELAPSED</span></div>')
+    body.append("</div>")
 
-    # --- Yesterday at a glance
-    h.append("<h2>Since the last report</h2>")
-    if analysis["digest"]:
-        h.append("<ul class='risks'>")
-        for e in analysis["digest"][:20]:
-            h.append(f"<li>{esc(e)}</li>")
-        h.append("</ul>")
-    else:
-        h.append('<div class="muted">No recorded changes (first run, or a quiet day).</div>')
+    body.append('<div class="read"><div class="kicker">The one-line read</div><p>'
+                + headline(cfg, today, current_sprint, per_dev, analysis,
+                           all_current, all_stories)
+                + "</p></div>")
 
-    # --- Conversations to have today
-    h.append("<h2>Conversations to have today</h2>")
+    unreviewed = analysis["waiting_reviews"]
+    failing = [(s, pr) for s, pr in open_prs if pr.checks_failed]
+    body.append('<div class="tiles">')
+    body.append(_tile("Remaining", f"{remaining:g}", f"of {total:g} pts"))
+    body.append(_tile("Stories", f"{len(all_current)}",
+                      f"{sum(1 for s in all_current if s.done)} accepted",
+                      tone="good", tint="g"))
+    body.append(_tile("PRs open", f"{len(open_prs)}",
+                      (f'<span class="risk">{len(unreviewed)} unreviewed</span>'
+                       if unreviewed else "all reviewed")))
+    body.append(_tile("Blocked", f"{len(blocked)}",
+                      ", ".join(esc(s.sid) for s in blocked) or "nothing blocked",
+                      tone="risk" if blocked else "",
+                      tint="r" if blocked else "g"))
+    body.append(_tile("Risks", f"{len(all_risks)}",
+                      f"across {len({s.sid for s, _ in all_risks})} stories",
+                      tone="risk" if all_risks else "",
+                      tint="r" if all_risks else "g"))
+    body.append(_tile("Capacity", f"{len(out_today)} out" if out_today else "full",
+                      ", ".join(sorted(esc(d) for d in out_today)) or "everyone in",
+                      tone="warn" if out_today else "",
+                      tint="a" if out_today else "g"))
+    body.append("</div>")
+
+    body.append("<h2>Conversations to have today</h2>")
     if analysis["agenda"]:
-        h.append("<ul class='agenda' style='list-style:none;padding-left:0'>")
+        body.append('<div class="note">Routed to the owner who can move it. '
+                    'Items for absent devs are muted automatically.</div>')
+        body.append('<div class="agenda">')
         for owner, text in analysis["agenda"]:
-            h.append(f'<li><span class="owner">{esc(owner)}</span> {esc(text)}</li>')
-        h.append("</ul>")
+            body.append(f'<div class="item"><div><div class="owner">{esc(owner)}</div></div>'
+                        f'<div class="body">{esc(text)}</div></div>')
+        body.append("</div>")
     else:
-        h.append('<div class="muted">Nothing needs an intervention this morning. 🎉</div>')
+        body.append('<div class="note">Nothing needs an intervention this morning.</div>')
 
-    # --- Pod summary table
-    h.append("<h2>Pod summary</h2><table><tr><th>Dev</th>"
-             "<th class='num'>Stories</th><th class='num'>Points</th>"
-             "<th class='num'>Accepted</th><th class='num'>Remaining</th>"
-             "<th class='num'>PRs open</th><th class='num'>Blocked</th>"
-             "<th class='num'>G / Y / R</th></tr>")
+    # "Needs attention now" — every threshold breach, one card each. Each row
+    # carries its owner: a leader reading this must know who to talk to.
+    cards = []
+    if failing:
+        cards.append(_flag("Failing checks", len(failing),
+                           [f"{_sid_who(s)} — {pr.checks_failed} failing" for s, pr in failing]))
+    if unreviewed:
+        cards.append(_flag("Waiting on first review", len(unreviewed),
+                           [f'{_sid_who(s)} — {w}d, reviewer '
+                            f'{esc(", ".join(pr.awaiting) or "unassigned")}'
+                            for s, pr, w in unreviewed]))
+    if analysis["blocked_aging"]:
+        rows = [f'{_sid_who(s)} — {d}d, {esc(s.blocked_reason or "no reason recorded")}'
+                for s, d in analysis["blocked_aging"]]
+        rows.append(f'<span class="muted">Escalate at '
+                    f'{risks_cfg["blocked_escalate_days"]}d.</span>')
+        cards.append(_flag("Blocked", len(analysis["blocked_aging"]), rows))
+    big = [(s, pr) for s, pr in open_prs
+           if (pr.additions + pr.deletions) > risks_cfg["big_pr_lines"]]
+    if big:
+        rows = [f"{_sid_who(s)} — +{pr.additions}/−{pr.deletions}" for s, pr in big]
+        rows.append(f'<span class="muted">Threshold {risks_cfg["big_pr_lines"]} lines.</span>')
+        cards.append(_flag("Oversized PRs", len(big), rows, tone="warn"))
+    if analysis["accept_queue"]:
+        rows = [f"{_sid_who(s)} — Completed {d}d" for s, d in analysis["accept_queue"]]
+        rows.append(f'<span class="muted">PO agenda at '
+                    f'{risks_cfg["acceptance_wait_days"]}d.</span>')
+        cards.append(_flag("Awaiting PO acceptance", len(analysis["accept_queue"]),
+                           rows, tone="warn"))
+    actions = analysis["actions"]
+    if actions is not None and not actions.get("missing") and actions["open"]:
+        cards.append(_flag("Open action items", len(actions["open"]),
+                           [esc(i) for i in actions["open"][:4]], tone="warn"))
+    if analysis["hygiene"]:
+        cards.append(_flag("Data hygiene", len(analysis["hygiene"]),
+                           [f"{_sid_who(s)} — {esc(problem)}"
+                            for _, s, problem in analysis["hygiene"][:4]], tone="warn"))
+    if cards:
+        body.append("<h2>Needs attention now</h2>")
+        body.append('<div class="flags">' + "".join(cards) + "</div>")
+
+    # Digest + lateness spread, side by side.
+    body.append('<div class="twocol"><div>')
+    body.append("<h2>Since the last report</h2>")
+    if analysis["digest"]:
+        body.append('<ul class="digest">')
+        for e in analysis["digest"][:12]:
+            mark = "g" if "appeared" in e else "b"
+            glyph = "+" if mark == "g" else "→"
+            body.append(f'<li><span class="{mark}">{glyph}</span><span>{esc(e)}</span></li>')
+        body.append("</ul>")
+    else:
+        body.append('<div class="note">No recorded changes (first run, or a quiet day).</div>')
+    body.append("</div><div>")
+    body.append("<h2>Lateness spread</h2>")
+    body.append('<div class="spread">'
+                f'<div style="flex:{max(green, 0.01)};background:#2F6B4F"></div>'
+                f'<div style="flex:{max(yellow, 0.01)};background:#8A5A12"></div>'
+                f'<div style="flex:{max(red, 0.01)};background:#9B3327"></div></div>')
+    body.append('<div class="key">'
+                f'<span><span class="sw" style="background:#2F6B4F"></span>{green} on track</span>'
+                f'<span><span class="sw" style="background:#8A5A12"></span>{yellow} yellow</span>'
+                f'<span><span class="sw" style="background:#9B3327"></span>{red} red</span></div>')
+    body.append(f'<div class="ccap" style="margin-top:8pt">Yellow at '
+                f'{risks_cfg["yellow_gap_pct"]}% behind sprint elapsed, red at '
+                f'{risks_cfg["red_gap_pct"]}%. Counted across every sprint in scope.</div>')
+    body.append("</div></div>")
+
+    # ---- Reference pages -------------------------------------------------
+    if cfg["report"].get("burndown", True):
+        body.append('<div style="break-before:page;margin-top:44pt;padding-top:4pt">')
+        body.append("<h2>Pod burndown</h2>")
+        body.append('<div class="note">Reconstructed from Rally acceptance dates. '
+                    'Dots mark the days on which remaining points actually changed.</div>')
+        body.append('<div class="charts">')
+        for n in reversed(sprints):
+            s_start, s_end = sprint_window(cfg, n)
+            sprint_stories = [s for dev in per_dev.values() for s in dev.get(n, [])]
+            if not sprint_stories and n != current_sprint:
+                continue
+            label = (f'{esc(iteration_name(cfg, n))} <span class="muted">· '
+                     f'{"current" if n == current_sprint else "closed"}</span>')
+            body.append(_chart_block(label, "", burndown_svg(
+                f"Pod — {iteration_name(cfg, n)}", length,
+                total_points(sprint_stories),
+                burndown_series(sprint_stories, s_start, min(today, s_end)),
+                today_day=(today - s_start).days if n == current_sprint else None)))
+        body.append("</div></div>")
+
+    body.append("<h2>Pod summary</h2>")
+    body.append('<table class="data"><thead><tr><th>Dev</th>'
+                '<th class="num">Stories</th><th class="num">Points</th>'
+                '<th class="num">Accepted</th><th class="num">Remaining</th>'
+                '<th class="num">PRs open</th><th class="num">Blocked</th>'
+                '<th class="num">G / Y / R</th></tr></thead><tbody>')
     for dev, by_sprint in per_dev.items():
         cur = by_sprint.get(current_sprint, [])
         everything = [s for sp in by_sprint.values() for s in sp]
-        open_prs = sum(1 for s in everything for pr in s.all_prs if pr.state == "OPEN")
+        dev_prs = sum(1 for s in everything for pr in s.all_prs if pr.state == "OPEN")
         g = sum(1 for s in everything if s.lateness == "green")
         y = sum(1 for s in everything if s.lateness == "yellow")
-        r_ = sum(1 for s in everything if s.lateness == "red")
-        dev_label = esc(dev) + (" <span class='muted'>(out)</span>" if dev in out_today else "")
-        h.append(
-            f"<tr><td>{dev_label}</td>"
-            f"<td class='num'>{len(cur)}</td>"
-            f"<td class='num'>{total_points(cur):g}</td>"
-            f"<td class='num'>{total_points(cur) - remaining_points(cur):g}</td>"
-            f"<td class='num'>{remaining_points(cur):g}</td>"
-            f"<td class='num'>{open_prs}</td>"
-            f"<td class='num'>{sum(1 for s in everything if s.blocked)}</td>"
-            f"<td class='num'><span class='good'>{g}</span> / "
-            f"<span class='warn'>{y}</span> / <span class='risk'>{r_}</span></td></tr>"
+        r = sum(1 for s in everything if s.lateness == "red")
+        tag = ' <span class="muted" style="font-size:8.5pt">(out)</span>' if dev in out_today else ""
+        nblocked = sum(1 for s in everything if s.blocked)
+        body.append(
+            f"<tr><td>{esc(dev)}{tag}</td>"
+            f'<td class="num">{len(cur)}</td>'
+            f'<td class="num">{total_points(cur):g}</td>'
+            f'<td class="num">{total_points(cur) - remaining_points(cur):g}</td>'
+            f'<td class="num" style="font-weight:600">{remaining_points(cur):g}</td>'
+            f'<td class="num">{dev_prs}</td>'
+            f'<td class="num{" risk" if nblocked else ""}">{nblocked}</td>'
+            f'<td class="num"><span class="good">{g}</span> / '
+            f'<span class="warn">{y}</span> / <span class="risk">{r}</span></td></tr>'
         )
-    h.append(
-        f"<tr><th>Pod</th><th class='num'>{len(all_current)}</th>"
-        f"<th class='num'>{total_points(all_current):g}</th>"
-        f"<th class='num'>{total_points(all_current) - remaining_points(all_current):g}</th>"
-        f"<th class='num'>{remaining_points(all_current):g}</th>"
-        f"<th class='num'>{sum(1 for s in all_stories for pr in s.all_prs if pr.state == 'OPEN')}</th>"
-        f"<th class='num'>{len(blocked)}</th>"
-        f"<th class='num'>{len(all_risks)} risks</th></tr></table>"
+    body.append(
+        f'</tbody><tfoot><tr><td>Pod</td><td class="num">{len(all_current)}</td>'
+        f'<td class="num">{total:g}</td>'
+        f'<td class="num">{total - remaining:g}</td>'
+        f'<td class="num">{remaining:g}</td>'
+        f'<td class="num">{len(open_prs)}</td>'
+        f'<td class="num">{len(blocked)}</td>'
+        f'<td class="num">{len(all_risks)} risks</td></tr></tfoot></table>'
     )
 
-    # --- Promotion matrix
     targets = analysis["targets"]
+    body.append('<div class="twocol"><div>')
     if targets:
-        h.append("<h2>Promotion matrix</h2>")
-        h.append('<table class="matrix"><tr><th>Story</th><th>Dev</th>'
-                 + "".join(f"<th>{esc(t)}</th>" for t in targets) + "</tr>")
+        body.append("<h2>Promotion matrix</h2>")
+        body.append('<table class="data matrix"><thead><tr><th>Story</th><th>Dev</th>'
+                    + "".join(f"<th>{esc(t)}</th>" for t in targets)
+                    + "</tr></thead><tbody>")
         for dev, by_sprint in per_dev.items():
             for s in sorted(by_sprint.get(current_sprint, []), key=lambda x: x.sid):
                 row = promotion_matrix(s, targets)
-                cells = ""
-                for t in targets:
-                    sym, cls = MATRIX_SYMBOL[row[t]]
-                    cells += f'<td class="{cls}" title="{row[t]}">{sym}</td>'
-                h.append(f'<tr><td>{lat_dot(s)} <a href="{esc(s.url)}">{esc(s.sid)}</a></td>'
-                         f"<td>{esc(dev)}</td>{cells}</tr>")
-        h.append("</table>")
-        h.append('<div class="muted">✓ merged · ● PR open · ✗ PR declined/closed · — no PR</div>')
-
-    # --- Reviews & CI
-    h.append("<h2>Reviews &amp; CI</h2>")
-    waiting = analysis["waiting_reviews"]
-    if waiting:
-        h.append("<div><strong>PRs waiting on a first review</strong></div><ul class='risks'>")
-        for s, pr, wait in waiting:
-            who = ", ".join(pr.awaiting) or "no reviewer assigned"
-            cls = "risk" if wait >= cfg["risks"]["review_wait_days"] else ""
-            h.append(f'<li class="{cls}">{story_ref(s)} — waiting {wait}d, '
-                     f'reviewer: {esc(who)} · <a href="{esc(pr.url)}">PR</a></li>')
-        h.append("</ul>")
-    else:
-        h.append('<div class="muted">No PRs waiting on review.</div>')
-    failing = [(s, pr) for s in all_stories for pr in s.all_prs
-               if pr.state == "OPEN" and pr.checks_failed]
-    if failing:
-        h.append("<div><strong>Failing checks</strong></div><ul class='risks'>")
-        for s, pr in failing:
-            h.append(f'<li class="risk">{story_ref(s)} — {pr.checks_failed} failing '
-                     f'· <a href="{esc(pr.url)}">PR</a></li>')
-        h.append("</ul>")
-    big = [(s, pr) for s in all_stories for pr in s.all_prs
-           if pr.state == "OPEN" and (pr.additions + pr.deletions) > cfg["risks"]["big_pr_lines"]]
-    if big:
-        h.append("<div><strong>Oversized PRs</strong></div><ul class='risks'>")
-        for s, pr in big:
-            h.append(f'<li class="warn">{story_ref(s)} — +{pr.additions}/−{pr.deletions} '
-                     f'· <a href="{esc(pr.url)}">PR</a></li>')
-        h.append("</ul>")
-    if analysis["review_load"]:
-        load = sorted(analysis["review_load"].items(), key=lambda kv: -kv[1])
-        h.append('<div><strong>Review load</strong> <span class="muted">— '
-                 + ", ".join(f"{esc(k)}: {v}" for k, v in load) + "</span></div>")
-
-    # --- Blockers & acceptance aging
-    h.append("<h2>Blocked &amp; awaiting acceptance</h2>")
-    if analysis["blocked_aging"]:
-        h.append("<ul class='risks'>")
-        for s, days in analysis["blocked_aging"]:
-            h.append(f'<li class="risk">{story_ref(s)} — blocked {days}d: '
-                     f"{esc(s.blocked_reason or 'no reason recorded')}</li>")
-        h.append("</ul>")
-    if analysis["accept_queue"]:
-        h.append("<div><strong>Awaiting PO acceptance</strong></div><ul class='risks'>")
-        for s, days in analysis["accept_queue"]:
-            cls = "risk" if days >= cfg["risks"]["acceptance_wait_days"] else ""
-            h.append(f'<li class="{cls}">{story_ref(s)} — Completed for {days}d</li>')
-        h.append("</ul>")
-    if not analysis["blocked_aging"] and not analysis["accept_queue"]:
-        h.append('<div class="muted">Nothing blocked, nothing waiting on acceptance.</div>')
-
-    # --- Scope churn
+                cells = "".join(
+                    f'<td class="{MATRIX_SYMBOL[row[t]][1]}" title="{row[t]}">'
+                    f"{MATRIX_SYMBOL[row[t]][0]}</td>" for t in targets)
+                body.append(f'<tr><td>{lat_dot(s)}<a href="{esc(s.url)}">{esc(s.sid)}</a></td>'
+                            f"<td>{esc((s.owner or dev).split()[0])}</td>{cells}</tr>")
+        body.append("</tbody></table>")
+        body.append('<div class="ccap"><span class="m-merged">✓</span> merged &nbsp; '
+                    '<span class="m-open">●</span> PR open &nbsp; '
+                    '<span class="m-declined">✗</span> declined &nbsp; '
+                    '<span class="m-none">—</span> no PR</div>')
+    body.append("</div><div>")
+    body.append("<h2>Hygiene &amp; scope</h2>")
+    rows = []
+    for dev, s, problem in analysis["hygiene"]:
+        rows.append(f"<li>{_sid_who(s)} — {esc(problem)}</li>")
     churn = analysis["churn"]
     if churn and churn["added"]:
-        h.append("<h2>Scope change</h2><ul class='risks'>")
         for s in churn["added"]:
             pts = f"{s.points:g} pts" if s.points is not None else "unestimated"
-            h.append(f'<li class="warn">{story_ref(s)} — {pts}, added after sprint start '
-                     f'(baseline {esc(churn["baseline_date"])})</li>')
-        h.append("</ul>")
-
-    # --- Action items
-    actions = analysis["actions"]
-    if actions is not None:
-        h.append("<h2>Action items</h2>")
-        if actions.get("missing"):
-            h.append(f'<div class="warn">Action items file not found: {esc(str(actions["path"]))}</div>')
-        elif actions["open"]:
-            h.append("<ul class='risks'>")
-            for item in actions["open"]:
-                h.append(f"<li>☐ {esc(item)}</li>")
-            h.append("</ul>")
-        else:
-            h.append('<div class="muted">No open action items. 🎉</div>')
-
-    # --- Hygiene
-    if analysis["hygiene"]:
-        h.append("<h2>Data hygiene</h2><ul class='risks'>")
-        for dev, s, problem in analysis["hygiene"]:
-            h.append(f'<li class="warn">{story_ref(s)} — {esc(problem)}</li>')
-        h.append("</ul>")
-
-    # --- Pod burndown: one chart per sprint, newest first, reconstructed
-    # from Rally acceptance dates.
-    h.append("<h2>Burndown</h2><div class='charts'>")
-    for n in reversed(sprints):
-        s_start, s_end = sprint_window(cfg, n)
-        cap = min(today, s_end)
-        sprint_stories = [s for dev in per_dev.values() for s in dev.get(n, [])]
-        if not sprint_stories and n != current_sprint:
-            continue
-        h.append("<div>" + burndown_svg(
-            f"Pod — {iteration_name(cfg, n)}", length,
-            total_points(sprint_stories),
-            burndown_series(sprint_stories, s_start, cap),
-            today_day=(today - s_start).days if n == current_sprint else None,
-        ) + "</div>")
-    h.append("</div>")
-
-    # --- All flagged risks
-    h.append("<h2>All flagged risks</h2>")
-    if all_risks:
-        h.append("<ul class='risks'>")
-        for s, (tag, msg) in all_risks:
-            h.append(f'<li class="risk"><strong>{esc(s.sid)}</strong> [{esc(tag)}] {esc(msg)}</li>')
-        h.append("</ul>")
+            rows.append(f'<li class="warn">{_sid_who(s)} ({pts}) added after sprint '
+                        f'start (baseline {esc(churn["baseline_date"])})</li>')
+    if rows:
+        body.append('<ul class="plainlist">' + "".join(rows) + "</ul>")
     else:
-        h.append('<div class="muted">None detected today. 🎉</div>')
+        body.append('<div class="note">Nothing to clean up: every story has criteria '
+                    "and an estimate, and no scope was added after the baseline.</div>")
+    if analysis["review_load"]:
+        load = sorted(analysis["review_load"].items(), key=lambda kv: -kv[1])
+        body.append('<div class="ccap" style="margin-top:8pt">Review load — '
+                    + ", ".join(f"{esc(k)} {v}" for k, v in load) + "</div>")
+    body.append("</div></div>")
 
-    # --- Per-dev sections
+    body.append("<h2>All flagged risks</h2>")
+    if all_risks:
+        body.append('<table class="data"><thead><tr><th style="width:66pt">Story</th>'
+                    '<th style="width:96pt">Owner</th>'
+                    '<th style="width:78pt">Tag</th><th>Detail</th></tr></thead><tbody>')
+        for s, (tag, msg) in all_risks:
+            owner_cell = (esc(s.owner) if s.owner
+                          else '<span class="risk">unassigned</span>')
+            body.append(f'<tr><td class="mono" style="font-weight:600">{esc(s.sid)}</td>'
+                        f"<td>{owner_cell}</td>"
+                        f'<td class="mono risk" style="font-size:8pt;font-weight:600">'
+                        f"{esc(tag)}</td><td>{esc(msg)}</td></tr>")
+        body.append("</tbody></table>")
+    else:
+        body.append('<div class="note">None detected today.</div>')
+
+    # ---- One page per dev ------------------------------------------------
     for dev, by_sprint in per_dev.items():
-        out_tag = ' <span class="muted">(out today)</span>' if dev in out_today else ""
-        h.append(f"<h2>{esc(dev)}{out_tag}</h2>")
+        everything = [s for sp in by_sprint.values() for s in sp]
+        cur = by_sprint.get(current_sprint, [])
+        nblocked = sum(1 for s in everything if s.blocked)
+        tone = "risk" if nblocked or any(s.lateness == "red" for s in everything) else \
+               ("good" if all(s.done for s in cur) and cur else "warn")
+        out_tag = (' <span class="warn" style="font:400 11pt/1 var(--sans)">out today</span>'
+                   if dev in out_today else "")
+        body.append('<div class="dev">')
+        body.append(f'<div class="devhead"><h3>{esc(dev)}{out_tag}</h3>'
+                    f'<div class="stat {tone}">{len(cur)} stories · '
+                    f'{total_points(cur):g} pts · {remaining_points(cur):g} remaining'
+                    + (f" · {nblocked} blocked" if nblocked else "") + "</div></div>")
 
         card = analysis["coaching"].get(dev)
         if card:
             risk = str(card.get("risk") or "none")
             risk_cls = {"none": "good", "watch": "warn", "action": "risk"}.get(risk, "muted")
-            h.append('<div class="card"><div class="seclab">Scorecard &amp; coaching</div>')
-            h.append('<div class="scorebox">')
+            body.append('<div class="scorebox">')
             for k in ("delivery", "quality", "communication", "collaboration"):
                 v = card.get("scores", {}).get(k, "?")
-                h.append(f'<div><div class="num">{esc(v)}</div><div class="lbl">{esc(k)}</div></div>')
-            h.append(f'<div><div class="num {risk_cls}">{esc(risk)}</div><div class="lbl">risk</div></div>')
-            h.append("</div>")
+                body.append(f'<div><div class="num">{esc(v)}</div>'
+                            f'<div class="lbl">{esc(k)}</div></div>')
+            body.append(f'<div><div class="num {risk_cls}">{esc(risk)}</div>'
+                        f'<div class="lbl">risk</div></div></div>')
             if risk != "none" and card.get("risk_reason"):
-                h.append(f'<div class="{risk_cls}">⚠ {esc(card["risk_reason"])}</div>')
+                body.append(f'<div class="line {risk_cls}">⚠ {esc(card["risk_reason"])}</div>')
             for s_txt in card.get("strengths") or []:
-                h.append(f'<div class="good">＋ {esc(s_txt)}</div>')
+                body.append(f'<div class="line good">＋ {esc(s_txt)}</div>')
             for c_txt in card.get("coaching") or []:
-                h.append(f"<div>→ {esc(c_txt)}</div>")
+                body.append(f'<div class="line">→ {esc(c_txt)}</div>')
             qs = card.get("questions_requests") or []
             if qs:
-                h.append('<div class="sec"><div class="seclab">Outstanding questions / requests from them</div>')
+                body.append('<div class="fieldlab" style="margin-top:10pt">Outstanding '
+                            "questions from them</div>")
                 for q in qs:
-                    h.append(f"<div>? {esc(q)}</div>")
-                h.append("</div>")
-            h.append("</div>")
-        elif analysis["ai_enabled"]:
-            h.append('<div class="muted">No coaching analysis available today.</div>')
+                    body.append(f'<div class="line">? {esc(q)}</div>')
 
         snippets = analysis["comms"].get(dev) or []
         if snippets:
-            h.append('<div class="card"><div class="seclab">Recent mentions in transcripts / chats / email</div>')
+            body.append('<div class="quotes"><div class="fieldlab" '
+                        'style="margin-bottom:8pt">In their own words — transcripts, '
+                        "chat, email</div>")
             for sn in snippets:
                 src = f"{sn['source']}.{sn['table']}" + (f" · {sn['date']}" if sn["date"] else "")
-                h.append(f'<div class="snippet"><b>{esc(src)}</b> — {esc(sn["snippet"])}</div>')
-            h.append("</div>")
+                body.append(f'<div class="q">“{esc(sn["snippet"])}”'
+                            f'<span class="src"> &nbsp;{esc(src)}</span></div>')
+            body.append("</div>")
 
-        h.append("<div class='charts'>")
-        for n in reversed(sprints):
-            s_start, s_end = sprint_window(cfg, n)
-            dev_stories = by_sprint.get(n, [])
-            if not dev_stories and n != current_sprint:
-                continue
-            h.append("<div>" + burndown_svg(
-                f"{esc(dev)} — {iteration_name(cfg, n)}", length,
-                total_points(dev_stories),
-                burndown_series(dev_stories, s_start, min(today, s_end)),
-                today_day=(today - s_start).days if n == current_sprint else None,
-            ) + "</div>")
-        h.append("</div>")
+        if cfg["report"].get("burndown", True):
+            body.append('<div class="charts">')
+            for n in reversed(sprints):
+                s_start, s_end = sprint_window(cfg, n)
+                dev_stories = by_sprint.get(n, [])
+                if not dev_stories and n != current_sprint:
+                    continue
+                label = (f'{esc(iteration_name(cfg, n))} <span class="muted">· '
+                         f'{"current" if n == current_sprint else "closed"}</span>')
+                body.append(_chart_block(label, "", burndown_svg(
+                    f"{dev} — {iteration_name(cfg, n)}", length,
+                    total_points(dev_stories),
+                    burndown_series(dev_stories, s_start, min(today, s_end)),
+                    today_day=(today - s_start).days if n == current_sprint else None)))
+            body.append("</div>")
+
         for n in sprints:
             stories = by_sprint.get(n, [])
             if n != current_sprint:
-                carry = [s for s in stories if not s.done]
-                if not carry:
-                    continue
-                h.append(f"<h3>{esc(iteration_name(cfg, n))} — unfinished (spillover)</h3>")
-                stories = carry
-            else:
-                h.append(f"<h3>{esc(iteration_name(cfg, n))} (current)</h3>")
+                stories = [s for s in stories if not s.done]
                 if not stories:
-                    h.append('<div class="warn">No stories assigned in the current sprint.</div>')
+                    continue
+                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
+                            "unfinished spillover</div>")
+            else:
+                body.append(f'<div class="seclab">{esc(iteration_name(cfg, n))} — '
+                            "current</div>")
+                if not stories:
+                    body.append('<div class="line warn">No stories assigned in the '
+                                "current sprint.</div>")
             for s in stories:
-                h.append(render_story(s, n, current_sprint))
+                body.append(render_story(s, n, current_sprint))
+        body.append("</div>")
 
-    h.append(f'<div class="muted" style="margin-top:32px">Generated by pod-audit.py '
-             f"on {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}</div>")
-    return "\n".join(h)
+    body.append(
+        '<div class="colophon">Thresholds in force — stale PR '
+        f'{risks_cfg["stale_pr_days"]}d · unreviewed {risks_cfg["review_wait_days"]}d · '
+        f'blocked escalation {risks_cfg["blocked_escalate_days"]}d · acceptance wait '
+        f'{risks_cfg["acceptance_wait_days"]}d · oversized PR {risks_cfg["big_pr_lines"]} '
+        f'lines · WIP limit {cfg["pod"]["wip_limit"]} · yellow '
+        f'{risks_cfg["yellow_gap_pct"]}% / red {risks_cfg["red_gap_pct"]}% behind elapsed. '
+        + ("AI judgment layer on." if analysis["ai_enabled"]
+           else "AI judgment layer off — acceptance criteria show story-level estimates.")
+        + "</div>"
+    )
+
+    runhead = (f'<div class="runhead"><span>{esc(pod)} &nbsp;·&nbsp; Morning report</span>'
+               f'<span>{today.strftime("%a %d %b %Y")} &nbsp;·&nbsp; {esc(it_name)}, '
+               f"day {day_no} / {length}</span></div>")
+    runfoot = (f'<div class="runfoot"><span>pod-audit.py &nbsp;·&nbsp; generated '
+               f'{dt.datetime.now().strftime("%Y-%m-%d %H:%M")}</span>'
+               f"<span>For pod leadership — TL / PM / PO / SM</span></div>")
+
+    return "\n".join([
+        f"<title>{esc(pod)} audit {today.isoformat()}</title>",
+        f"<style>{CSS}</style>",
+        '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>',
+        '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?'
+        "family=Geist+Mono:wght@400..600&family=Instrument+Sans:wght@400..700&"
+        'family=Manrope:wght@500..800&display=swap">',
+        '<table class="frame"><thead><tr><td>' + runhead + "</td></tr></thead>",
+        "<tbody><tr><td>",
+        "\n".join(body),
+        "</td></tr></tbody>",
+        "<tfoot><tr><td>" + runfoot + "</td></tr></tfoot></table>",
+    ])
 
 
 # --------------------------------------------------------------------------
@@ -2329,7 +2688,9 @@ def main():
         out_dir = (cfg["_dir"] / cfg["report"]["output_dir"]).expanduser()
         out_dir.mkdir(parents=True, exist_ok=True)
         report_path = out_dir / f"{slug}-audit-{today.isoformat()}.html"
-        report_path.write_text("<!doctype html>\n<meta charset='utf-8'>\n" + html_out)
+        report_path.write_text(
+            "<!doctype html>\n<html lang='en'>\n<meta charset='utf-8'>\n"
+            + html_out + "\n</html>\n")
     except OSError as e:
         die(f"Cannot write report to {cfg['report']['output_dir']}: {e}")
 
