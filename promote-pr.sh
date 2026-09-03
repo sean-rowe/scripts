@@ -12,9 +12,16 @@
 #   promote-pr.sh --to 45 --pr 123 [--pr 456 ...]
 #   promote-pr.sh --to release-45 --pr 123,456
 #   promote-pr.sh --to main --story US833008
+#   promote-pr.sh --to qa --from-release 45
 #
 # The target (--to) accepts "main", "release-45", a bare number (45 ->
 # release-45), or any other branch name verbatim.
+#
+# With --from-release, no PRs are involved: the whole release branch is
+# MERGED into the target instead (e.g. promote release-45 to qa). A work
+# branch is created off the target, the release branch is merged into it,
+# and a PR into the target is opened. --from-release accepts the same
+# forms as --to and cannot be combined with --pr/--story.
 #
 # What it does:
 #   1. Resolves the PR list (explicit --pr, or find-rally-prs.sh <story>)
@@ -38,8 +45,10 @@
 # Options:
 #   --pr <n[,n...]>       PR number(s) to promote (repeatable)
 #   --story <id>          Rally story/defect id -> PRs via find-rally-prs.sh
-#   --to <target>         Target branch: main | release-45 | 45 (required)
+#   --to <target>         Target branch: main | release-45 | 45 | qa (required)
 #   --to-release <n>      Alias for --to
+#   --from-release <n>    Merge this whole release branch into the target
+#                         (e.g. --to qa --from-release 45); excludes --pr/--story
 #   --remote <name>       Git remote (default: origin)
 #   --release-prefix <p>  Release branch prefix (default: release-)
 #   --branch-name <name>  Override the generated work branch name
@@ -61,6 +70,9 @@ set -euo pipefail
 PRS=()
 STORY=""
 TARGET_SPEC=""
+FROM_SPEC=""
+FROM_BRANCH=""
+MODE="pick"
 REMOTE="origin"
 RELEASE_PREFIX="release-"
 BRANCH_OVERRIDE=""
@@ -89,6 +101,7 @@ while [[ $# -gt 0 ]]; do
     --pr)             IFS=',' read -ra _prs <<< "${2:-}"; PRS+=("${_prs[@]}"); shift 2 ;;
     --story)          STORY="${2:-}"; shift 2 ;;
     --to|--to-release) TARGET_SPEC="${2:-}"; shift 2 ;;
+    --from-release)   FROM_SPEC="${2:-}"; shift 2 ;;
     --remote)         REMOTE="${2:-}"; shift 2 ;;
     --release-prefix) RELEASE_PREFIX="${2:-}"; shift 2 ;;
     --branch-name)    BRANCH_OVERRIDE="${2:-}"; shift 2 ;;
@@ -116,17 +129,43 @@ command -v jq >/dev/null 2>&1 || die "jq not found. Install with: brew install j
 save_state() {
   cat > "$STATE_FILE" <<EOF
 STORY='$STORY'
+MODE='$MODE'
 TO_BRANCH='$TO_BRANCH'
+FROM_BRANCH='$FROM_BRANCH'
 REMOTE='$REMOTE'
 RELEASE_PREFIX='$RELEASE_PREFIX'
 CREATE_PR=$CREATE_PR
 OPEN_PR=$OPEN_PR
-PR_LIST='${PRS[*]}'
+PR_LIST='${PRS[*]-}'
 NEW_BRANCH='$NEW_BRANCH'
 FORCE_PUSH=$FORCE_PUSH
 NEXT_INDEX=$1
-COMMITS_STR='${COMMITS[*]}'
+COMMITS_STR='${COMMITS[*]-}'
 EOF
+}
+
+# Stage the user's conflict resolutions automatically, refusing only if a
+# file still contains conflict markers (i.e. wasn't actually resolved).
+stage_resolved_files() {
+  local f
+  UNMERGED=()
+  while IFS= read -r f; do
+    UNMERGED+=("$f")
+  done < <(git diff --name-only --diff-filter=U)
+  [[ ${#UNMERGED[@]} -gt 0 ]] || return 0
+  STILL_CONFLICTED=()
+  for f in "${UNMERGED[@]}"; do
+    if [[ -f "$f" ]] && grep -qE '^(<{7}|>{7})( |$)' "$f"; then
+      STILL_CONFLICTED+=("$f")
+    fi
+  done
+  if [[ ${#STILL_CONFLICTED[@]} -gt 0 ]]; then
+    echo "These files still contain conflict markers (<<<<<<< / >>>>>>>):" >&2
+    printf '    %s\n' "${STILL_CONFLICTED[@]}" >&2
+    die "Finish resolving them, then re-run --continue."
+  fi
+  info "Staging resolved files: ${UNMERGED[*]}"
+  git add -A -- "${UNMERGED[@]}"
 }
 
 # --- --abort: discard an interrupted run -------------------------------------
@@ -135,6 +174,7 @@ if $ABORT_RUN; then
   # shellcheck disable=SC1090
   . "$STATE_FILE"
   git cherry-pick --abort >/dev/null 2>&1 || true
+  git merge --abort >/dev/null 2>&1 || true
   if [[ "$(git rev-parse --abbrev-ref HEAD)" == "$NEW_BRANCH" ]]; then
     if git rev-parse --verify --quiet refs/heads/main >/dev/null; then
       git switch -q main
@@ -162,19 +202,38 @@ if $CONTINUE_RUN; then
   # shellcheck disable=SC2206
   PRS=($PR_LIST)
   START_INDEX=$NEXT_INDEX
-  info "Resuming onto ${TO_BRANCH} (commit $NEXT_INDEX of ${#COMMITS[@]} was in progress)"
+  if [[ "$MODE" == "merge" ]]; then
+    info "Resuming the merge of ${FROM_BRANCH} into ${TO_BRANCH}"
+  else
+    info "Resuming onto ${TO_BRANCH} (commit $NEXT_INDEX of ${#COMMITS[@]} was in progress)"
+  fi
 else
-  [[ -n "$TARGET_SPEC" ]] || die "--to is required (main, release-45, or 45)"
-  [[ ${#PRS[@]} -gt 0 || -n "$STORY" ]] || die "Give --pr <n> (repeatable) or --story <id>"
+  [[ -n "$TARGET_SPEC" ]] || die "--to is required (main, release-45, 45, or qa)"
+  if [[ -n "$FROM_SPEC" ]]; then
+    MODE="merge"
+    [[ ${#PRS[@]} -eq 0 && -z "$STORY" ]] \
+      || die "--from-release merges the whole release; it cannot be combined with --pr/--story"
+  else
+    [[ ${#PRS[@]} -gt 0 || -n "$STORY" ]] \
+      || die "Give --pr <n> (repeatable), --story <id>, or --from-release <n>"
+  fi
   if [[ -f "$STATE_FILE" ]] && ! $DRY_RUN; then
     die "An interrupted run exists. Re-run with --continue to resume it, or --abort to discard it."
   fi
 
-  # Resolve the target: main | release-45 | bare number | any branch name
+  # Resolve target and source: main | release-45 | bare number | any branch name
   if [[ "$TARGET_SPEC" =~ ^[0-9]+$ ]]; then
     TO_BRANCH="${RELEASE_PREFIX}${TARGET_SPEC}"
   else
     TO_BRANCH="$TARGET_SPEC"
+  fi
+  if [[ -n "$FROM_SPEC" ]]; then
+    if [[ "$FROM_SPEC" =~ ^[0-9]+$ ]]; then
+      FROM_BRANCH="${RELEASE_PREFIX}${FROM_SPEC}"
+    else
+      FROM_BRANCH="$FROM_SPEC"
+    fi
+    [[ "$FROM_BRANCH" != "$TO_BRANCH" ]] || die "--from-release and --to are the same branch"
   fi
 fi
 
@@ -182,6 +241,40 @@ if ! $CONTINUE_RUN; then
   if [[ -n "$(git status --porcelain)" ]]; then
     die "Working tree is not clean. Commit or stash your changes first."
   fi
+
+  if [[ "$MODE" == "merge" ]]; then
+    # --- Merge mode: promote a whole release branch into the target ----------
+    info "Fetching from $REMOTE..."
+    git fetch --prune "$REMOTE"
+    git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${FROM_BRANCH}" >/dev/null \
+      || die "Branch '$FROM_BRANCH' does not exist on '$REMOTE'"
+    git rev-parse --verify --quiet "refs/remotes/${REMOTE}/${TO_BRANCH}" >/dev/null \
+      || die "Branch '$TO_BRANCH' does not exist on '$REMOTE'"
+
+    AHEAD=$(git rev-list --count "${REMOTE}/${TO_BRANCH}..${REMOTE}/${FROM_BRANCH}")
+    if [[ "$AHEAD" -eq 0 ]]; then
+      echo "'$TO_BRANCH' already has everything on '$FROM_BRANCH'. Nothing to promote."
+      exit 0
+    fi
+    info "$FROM_BRANCH is $AHEAD commit(s) ahead of $TO_BRANCH:"
+    git log --oneline "${REMOTE}/${TO_BRANCH}..${REMOTE}/${FROM_BRANCH}" | head -30 | sed 's/^/    /'
+    if [[ "$AHEAD" -gt 30 ]]; then
+      echo "    ... and $((AHEAD - 30)) more"
+    fi
+
+    if ! $ASSUME_YES && ! $DRY_RUN; then
+      if [[ -t 0 ]]; then
+        printf 'Merge %s into %s? [y/N] ' "$FROM_BRANCH" "$TO_BRANCH"
+        read -r REPLY
+        [[ "$REPLY" =~ ^[Yy] ]] || { echo "Cancelled."; exit 1; }
+      else
+        die "Not a terminal; re-run with --yes to skip confirmation."
+      fi
+    fi
+
+    COMMITS=()
+    NEW_BRANCH="${BRANCH_OVERRIDE:-${FROM_BRANCH}-to-${TO_BRANCH}}"
+  else
 
   # --- Resolve the PR list from the story if needed --------------------------
   if [[ ${#PRS[@]} -eq 0 ]]; then
@@ -328,6 +421,8 @@ if ! $CONTINUE_RUN; then
     NEW_BRANCH="promote/pr-${JOINED:0:40}-${TO_BRANCH}"
   fi
 
+  fi  # end of pick-mode resolution
+
   REUSE_LOCAL=false
   FORCE_PUSH=false
   git rev-parse --verify --quiet "refs/heads/${NEW_BRANCH}" >/dev/null && REUSE_LOCAL=true
@@ -339,7 +434,11 @@ if ! $CONTINUE_RUN; then
     else
       info "[dry-run] Would create '$NEW_BRANCH' from '${REMOTE}/${TO_BRANCH}',"
     fi
-    info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
+    if [[ "$MODE" == "merge" ]]; then
+      info "[dry-run] merge '${REMOTE}/${FROM_BRANCH}' into it ($AHEAD commit(s)), push to '$REMOTE',"
+    else
+      info "[dry-run] cherry-pick the ${#COMMITS[@]} commit(s) above, push to '$REMOTE',"
+    fi
     if $CREATE_PR; then
       info "[dry-run] and open a PR from '$NEW_BRANCH' into '$TO_BRANCH'."
     else
@@ -360,36 +459,43 @@ if ! $CONTINUE_RUN; then
     fi
     git switch --create "$NEW_BRANCH" "${REMOTE}/${TO_BRANCH}"
   fi
+
+  if [[ "$MODE" == "merge" ]]; then
+    save_state 0
+    info "Merging '${REMOTE}/${FROM_BRANCH}' into '$NEW_BRANCH'..."
+    if ! MERGE_OUT=$(git merge --no-ff -m "Merge ${FROM_BRANCH} into ${TO_BRANCH}" "${REMOTE}/${FROM_BRANCH}" 2>&1); then
+      echo "$MERGE_OUT" >&2
+      cat >&2 <<EOF
+
+CONFLICT while merging ${FROM_BRANCH} into ${TO_BRANCH}
+
+Progress has been saved. Edit the conflicted files to resolve them, then:
+
+    $SCRIPT_NAME --continue     # stages your fixes, finishes the merge, pushes, opens the PR
+
+To give up instead:
+
+    $SCRIPT_NAME --abort
+EOF
+      exit 1
+    fi
+  fi
 else
   # --- Resume: finish whatever was interrupted -------------------------------
   if [[ "$(git rev-parse --abbrev-ref HEAD)" != "$NEW_BRANCH" ]]; then
-    git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
-      && die "A cherry-pick is in progress on a different branch; resolve or abort it first."
+    { git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null \
+        || git rev-parse -q --verify MERGE_HEAD >/dev/null; } \
+      && die "A cherry-pick or merge is in progress on a different branch; resolve or abort it first."
     git switch "$NEW_BRANCH"
   fi
 
-  if git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
-    # Stage the user's resolutions automatically, refusing only if a file
-    # still contains conflict markers (i.e. wasn't actually resolved).
-    UNMERGED=()
-    while IFS= read -r f; do
-      UNMERGED+=("$f")
-    done < <(git diff --name-only --diff-filter=U)
-    if [[ ${#UNMERGED[@]} -gt 0 ]]; then
-      STILL_CONFLICTED=()
-      for f in "${UNMERGED[@]}"; do
-        if [[ -f "$f" ]] && grep -qE '^(<{7}|>{7})( |$)' "$f"; then
-          STILL_CONFLICTED+=("$f")
-        fi
-      done
-      if [[ ${#STILL_CONFLICTED[@]} -gt 0 ]]; then
-        echo "These files still contain conflict markers (<<<<<<< / >>>>>>>):" >&2
-        printf '    %s\n' "${STILL_CONFLICTED[@]}" >&2
-        die "Finish resolving them, then re-run --continue."
-      fi
-      info "Staging resolved files: ${UNMERGED[*]}"
-      git add -A -- "${UNMERGED[@]}"
-    fi
+  if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+    stage_resolved_files
+    info "Finishing the interrupted merge..."
+    GIT_EDITOR=true git commit --no-edit >/dev/null 2>&1 \
+      || die "'git commit' failed to finish the merge. Resolve the problem and re-run --continue."
+  elif git rev-parse -q --verify CHERRY_PICK_HEAD >/dev/null; then
+    stage_resolved_files
     info "Finishing the interrupted cherry-pick..."
     if ! GIT_EDITOR=true git cherry-pick --continue >/dev/null 2>&1; then
       if [[ -z "$(git diff --cached --name-only)" ]]; then
@@ -453,9 +559,14 @@ if [[ "$APPLIED" -eq 0 ]]; then
   echo "=============================================================="
   echo " NOTHING TO PROMOTE"
   echo "=============================================================="
-  echo " Every change in PR(s) ${PRS[*]} is already on '$TO_BRANCH'"
-  echo " (the same patches landed there previously under different"
-  echo " commit hashes). No branch pushed, no PR created."
+  if [[ "$MODE" == "merge" ]]; then
+    echo " '$TO_BRANCH' already has everything on '$FROM_BRANCH'."
+    echo " No branch pushed, no PR created."
+  else
+    echo " Every change in PR(s) ${PRS[*]-} is already on '$TO_BRANCH'"
+    echo " (the same patches landed there previously under different"
+    echo " commit hashes). No branch pushed, no PR created."
+  fi
   echo "=============================================================="
   exit 0
 fi
@@ -478,7 +589,9 @@ if $CREATE_PR; then
   # target) and body, like promote-pr. Multi/story: composed title.
   PR_TITLE=""
   ORIG_BODY=""
-  if [[ ${#PRS[@]} -eq 1 ]]; then
+  if [[ "$MODE" == "merge" ]]; then
+    PR_TITLE="Merge ${FROM_BRANCH} into ${TO_BRANCH}"
+  elif [[ ${#PRS[@]} -eq 1 ]]; then
     PR_TITLE=$(gh pr view "${PRS[0]}" --json title --jq '.title' 2>/dev/null) || PR_TITLE=""
     ORIG_BODY=$(gh pr view "${PRS[0]}" --json body --jq '.body' 2>/dev/null) || ORIG_BODY=""
     if [[ -n "$PR_TITLE" && "$TO_BRANCH" =~ ^${RELEASE_PREFIX}[0-9]+$ ]]; then
@@ -492,10 +605,14 @@ if $CREATE_PR; then
       PR_TITLE="Promote PR(s) ${PRS[*]} to $TO_BRANCH"
     fi
   fi
-  PR_BODY="${ORIG_BODY}${ORIG_BODY:+
+  if [[ "$MODE" == "merge" ]]; then
+    PR_BODY="Merges $APPLIED commit(s) from ${FROM_BRANCH} into ${TO_BRANCH} by $SCRIPT_NAME."
+  else
+    PR_BODY="${ORIG_BODY}${ORIG_BODY:+
 
 }---
-Cherry-picked $APPLIED commit(s) from PR(s) ${PRS[*]} onto ${TO_BRANCH} by $SCRIPT_NAME."
+Cherry-picked $APPLIED commit(s) from PR(s) ${PRS[*]-} onto ${TO_BRANCH} by $SCRIPT_NAME."
+  fi
   info "Creating pull request via gh..."
   PR_URL=$(gh pr create --base "$TO_BRANCH" --head "$NEW_BRANCH" \
              --title "$PR_TITLE" --body "$PR_BODY" 2>&1 \
@@ -513,11 +630,16 @@ echo
 echo "=============================================================="
 echo " SUCCESS"
 echo "=============================================================="
-echo " Promoted:      ${#PRS[@]} PR(s): ${PRS[*]}"
-if [[ "$APPLIED" -lt "$TOTAL" ]]; then
-  echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH ($((TOTAL - APPLIED)) already there, skipped)"
+if [[ "$MODE" == "merge" ]]; then
+  echo " Promoted:      $FROM_BRANCH -> $TO_BRANCH (merge)"
+  echo " Merged:        $APPLIED commit(s) onto $TO_BRANCH"
 else
-  echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH"
+  echo " Promoted:      ${#PRS[@]} PR(s): ${PRS[*]-}"
+  if [[ "$APPLIED" -lt "$TOTAL" ]]; then
+    echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH ($((TOTAL - APPLIED)) already there, skipped)"
+  else
+    echo " Cherry-picked: $APPLIED commit(s) onto $TO_BRANCH"
+  fi
 fi
 echo " New branch:    $NEW_BRANCH  (pushed to $REMOTE)"
 if [[ -n "$PR_URL" ]]; then
