@@ -10,6 +10,8 @@
 #   ./launch-firefox-bridge.sh            start server (if needed) + Firefox
 #   ./launch-firefox-bridge.sh --server   just the server, in the foreground
 #   ./launch-firefox-bridge.sh --restart  restart the server, then Firefox
+#   ./launch-firefox-bridge.sh --manual   start the server and tell you how to
+#                                         load the extension by hand (no npm)
 #
 # Ctrl+C stops Firefox; the server keeps running (stop it with --stop).
 
@@ -133,6 +135,10 @@ case "${1:-}" in
   --restart)
     stop_server
     ;;
+  --manual)
+    # Start the server, then print how to side-load the extension by hand.
+    MANUAL_LOAD=yes
+    ;;
 esac
 
 choose_port || exit 1
@@ -162,9 +168,110 @@ FF="/Applications/Firefox.app/Contents/MacOS/firefox"
 PROFILE="$STATE/firefox-profile"
 mkdir -p "$PROFILE"
 
+manual_instructions() {
+  cat <<EOM
+
+Load the extension by hand — this needs no npm and no web-ext:
+
+  1. In Firefox, open:   about:debugging#/runtime/this-firefox
+  2. Click:              Load Temporary Add-on…
+  3. Choose this file:   $DIR/firefox-extension/manifest.json
+  4. Open https://copilot.microsoft.com and type !help in the chat box.
+
+The bridge server is running on 127.0.0.1:$PORT and stays up after this
+script exits. Firefox forgets temporary add-ons when it restarts, so repeat
+steps 1-3 after a Firefox restart.
+EOM
+}
+
+if [ "${MANUAL_LOAD:-}" = yes ]; then
+  echo "Bridge server ready on 127.0.0.1:$PORT."
+  manual_instructions
+  exit 0
+fi
+
+# Prefer a web-ext that is already on disk. `npx --yes` reaches out to the
+# registry, which fails on a locked-down network — and it only ever worked
+# here because an earlier run left one in the npx cache.
+find_web_ext() {
+  command -v web-ext >/dev/null 2>&1 && { command -v web-ext; return 0; }
+  local c
+  for c in \
+    "$DIR/node_modules/.bin/web-ext" \
+    "$(dirname "$NODE_BIN")/web-ext" \
+    "$HOME/.npm-global/bin/web-ext" \
+    /usr/local/bin/web-ext \
+    /opt/homebrew/bin/web-ext; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  c="$(ls -d "$HOME"/.npm/_npx/*/node_modules/.bin/web-ext 2>/dev/null | head -1 || true)"
+  [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  return 1
+}
+
+WEB_EXT="$(find_web_ext || true)"
+
+# macOS has no `timeout(1)`, and npm against an unreachable or hostile registry
+# can sit there for a very long time. Cap it so the launcher never hangs.
+run_bounded() {
+  local secs="$1"; shift
+  "$@" &
+  local pid=$! i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$i" -ge "$secs" ]; then
+      kill -TERM "$pid" 2>/dev/null
+      sleep 1
+      kill -KILL "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 1
+    i=$((i + 1))
+  done
+  wait "$pid"
+}
+
+if [ -z "$WEB_EXT" ]; then
+  NPM_BIN="$(dirname "$NODE_BIN")/npm"
+  [ -x "$NPM_BIN" ] || NPM_BIN="$(command -v npm || true)"
+  echo "web-ext isn't installed. Installing it into $DIR/node_modules ..."
+  echo "(this uses whatever registry your .npmrc points at; up to 3 minutes)"
+  if [ -n "$NPM_BIN" ]; then
+    run_bounded 180 "$NPM_BIN" install --no-save --no-audit --no-fund \
+      --fetch-retries=1 --fetch-timeout=30000 \
+      --prefix "$DIR" web-ext >"$STATE/web-ext-install.log" 2>&1
+    case $? in
+      0) WEB_EXT="$(find_web_ext || true)" ;;
+      124) echo "npm timed out after 3 minutes." | tee -a "$STATE/web-ext-install.log" >&2 ;;
+    esac
+  else
+    echo "npm not found on PATH." > "$STATE/web-ext-install.log"
+  fi
+fi
+
+if [ -z "$WEB_EXT" ]; then
+  echo
+  echo "Could not install web-ext. Last lines of $STATE/web-ext-install.log:" >&2
+  tail -12 "$STATE/web-ext-install.log" 2>/dev/null >&2 || true
+  cat >&2 <<'EOM'
+
+If npm reported 403, it is talking to registry.npmjs.org instead of your
+corporate registry. npm reads that from .npmrc — not from ~/.ssh, which only
+applies to git-protocol dependencies:
+
+  npm config set registry https://<your-registry-host>/api/npm/npm/
+  npm login --registry https://<your-registry-host>/api/npm/npm/
+
+Then re-run this script. You do not need web-ext at all, though:
+EOM
+  manual_instructions
+  echo "The server is up; loading the extension by hand is all that's left." >&2
+  exit 1
+fi
+
 echo "Launching Firefox with the Copilot CLI Bridge extension ..."
+echo "(web-ext: $WEB_EXT)"
 echo "In the chat box, type !help to see what it can do."
-exec npx --yes web-ext run \
+exec "$WEB_EXT" run \
   --source-dir="$DIR/firefox-extension" \
   --firefox="$FF" \
   --firefox-profile="$PROFILE" \

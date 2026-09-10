@@ -60,7 +60,36 @@ than wandering if that one is taken.
 ./launch-firefox-bridge.sh --server    # just the server, foreground, for debugging
 ./launch-firefox-bridge.sh --restart   # restart the server, then Firefox
 ./launch-firefox-bridge.sh --stop      # stop the server
+./launch-firefox-bridge.sh --manual    # server only + how to side-load the extension
 ```
+
+### Behind a corporate npm registry
+
+The launcher uses [`web-ext`](https://github.com/mozilla/web-ext) to load the
+extension. It prefers a copy already on disk — your PATH, `node_modules`, the npx
+cache, a global install — and only installs one if it finds none, capped at three
+minutes so it can't hang.
+
+If that install fails with **403**, npm is reaching `registry.npmjs.org` instead of
+your registry. npm reads that from `.npmrc`; `~/.ssh` has nothing to do with it
+(SSH keys only apply to git-protocol dependencies):
+
+```bash
+npm config set registry https://<your-registry-host>/api/npm/npm/
+npm login --registry https://<your-registry-host>/api/npm/npm/
+```
+
+Or skip npm entirely — **web-ext is only a convenience**, and Firefox can load the
+extension by hand:
+
+```bash
+./launch-firefox-bridge.sh --manual
+```
+
+That starts the bridge server and prints the steps: open
+`about:debugging#/runtime/this-firefox`, click **Load Temporary Add-on…**, and pick
+`firefox-extension/manifest.json`. Firefox forgets temporary add-ons on restart, so
+repeat after restarting it.
 
 When the Copilot page loads you'll see a panel confirming the connection. Type
 `!help` in the chat box for the full command list.
