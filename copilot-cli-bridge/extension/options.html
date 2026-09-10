@@ -1,0 +1,43 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Copilot CLI Bridge — Options</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; max-width: 620px; margin: 32px auto; padding: 0 16px; }
+      code { background: #f4f4f4; padding: 1px 5px; border-radius: 4px; }
+      pre { background: #f4f4f4; padding: 12px; border-radius: 8px; overflow: auto; }
+      h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 24px; }
+      .note { color: #666; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <h1>Copilot CLI Bridge</h1>
+    <p class="note">
+      A plain bridge: when Copilot outputs a command block, it runs on your machine and
+      the output is pasted back. Behaviour options are in the toolbar popup.
+    </p>
+
+    <h2>How it triggers</h2>
+    <p>The bridge runs any code block whose first line is the marker (default <code>#!run</code>):</p>
+    <pre>```
+#!run
+git status
+```</pre>
+    <p>Tell Copilot once, so you just talk in plain English and it emits the blocks:</p>
+    <pre>When you want to run a shell command on my machine, output ONLY a fenced code
+block whose first line is exactly:
+    #!run
+followed by the command. I'll paste the output back.</pre>
+
+    <h2>Config (optional)</h2>
+    <p><code>~/.copilot-cli-bridge/config.json</code> — the bridge runs everything by default:</p>
+    <pre>{
+  "cwd": "/Users/srowe/Projects",   // working directory for commands
+  "timeoutMs": 120000,
+  "maxOutputBytes": 1000000,
+  "deny": []                        // optional substrings to block; empty = no limits
+}</pre>
+    <p class="note">A log of what ran is at <code>~/.copilot-cli-bridge/bridge.log</code>.</p>
+  </body>
+</html>

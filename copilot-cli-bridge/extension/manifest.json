@@ -1,0 +1,62 @@
+{
+  "manifest_version": 3,
+  "name": "Copilot CLI Bridge",
+  "version": "0.2.1",
+  "description": "Let Microsoft Copilot (Bing / Teams / M365) request local CLI commands via a Native Messaging host.",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "clipboardWrite",
+    "notifications",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://copilot.microsoft.com/*",
+    "https://www.bing.com/*",
+    "https://bing.com/*",
+    "https://teams.microsoft.com/*",
+    "https://teams.cloud.microsoft/*",
+    "https://m365.cloud.microsoft/*",
+    "https://www.office.com/*",
+    "https://outlook.office.com/*",
+    "https://copilot.cloud.microsoft/*",
+    "https://copilot.fun/*"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Copilot CLI Bridge"
+  },
+  "options_page": "options.html",
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://copilot.microsoft.com/*",
+        "https://www.bing.com/*",
+        "https://bing.com/*",
+        "https://teams.microsoft.com/*",
+        "https://teams.cloud.microsoft/*",
+        "https://m365.cloud.microsoft/*",
+        "https://www.office.com/*",
+        "https://outlook.office.com/*",
+        "https://copilot.cloud.microsoft/*",
+        "https://copilot.fun/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "manifest_version": 2,
+  "name": "Copilot CLI Bridge",
+  "version": "2.0.0",
+  "description": "Type ! in the Microsoft Copilot chat box to attach local files, search your code, and run commands.",
+  "permissions": [
+    "http://127.0.0.1/*",
+    "https://copilot.microsoft.com/*",
+    "https://copilot.fun/*",
+    "https://m365.cloud.microsoft/*",
+    "https://www.bing.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://copilot.microsoft.com/*",
+        "https://copilot.fun/*",
+        "https://m365.cloud.microsoft/*",
+        "https://www.bing.com/chat*"
+      ],
+      "js": ["content.js"],
+      "all_frames": false,
+      "run_at": "document_idle"
+    }
+  ],
+  "background": { "scripts": ["token.js", "background.js"] },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "copilot-cli-bridge@local",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
+}
