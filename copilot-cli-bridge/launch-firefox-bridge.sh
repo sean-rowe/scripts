@@ -96,7 +96,7 @@ report_port_holder() {
   [ -z "$holder" ] && return 0
   echo
   echo "Port $1 is still in use — by something that isn't this bridge:"
-  ps -o pid=,command= -p "$holder" 2>/dev/null | cut -c1-100 | sed 's/^/  /'
+  ps -o pid=,command= -p "$holder" 2>/dev/null | cut -c1-100 | sed 's/^/  /' || true
   echo
   echo "  Stop it with:   kill $holder"
   echo "  Or ignore it:   the launcher walks to the next free port on its own."
@@ -175,7 +175,7 @@ choose_port || exit 1
 if [ "$ADOPTED" = yes ]; then
   # An older build only understands /run; replace it rather than talk to it.
   VERSION="$(curl -sf -m 2 -H "X-Bridge-Token: $TOKEN" "http://127.0.0.1:$PORT/ping" \
-             | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+             | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)"
   case "$VERSION" in
     2.*) echo "Bridge server already running on $PORT (v$VERSION)." ;;
     *)   echo "Replacing old bridge server (v${VERSION:-unknown}) ..."
@@ -265,12 +265,16 @@ if [ -z "$WEB_EXT" ]; then
   echo "web-ext isn't installed. Installing it into $DIR/node_modules ..."
   echo "(this uses whatever registry your .npmrc points at; up to 3 minutes)"
   if [ -n "$NPM_BIN" ]; then
+    # `|| rc=$?` is load-bearing: under `set -e` an untested failure here exits
+    # the script instantly, so a 403 from npm looked like a silent crash.
+    rc=0
     run_bounded 180 "$NPM_BIN" install --no-save --no-audit --no-fund \
       --fetch-retries=1 --fetch-timeout=30000 \
-      --prefix "$DIR" web-ext >"$STATE/web-ext-install.log" 2>&1
-    case $? in
+      --prefix "$DIR" web-ext >"$STATE/web-ext-install.log" 2>&1 || rc=$?
+    case $rc in
       0) WEB_EXT="$(find_web_ext || true)" ;;
       124) echo "npm timed out after 3 minutes." | tee -a "$STATE/web-ext-install.log" >&2 ;;
+      *) echo "npm exited $rc." >> "$STATE/web-ext-install.log" ;;
     esac
   else
     echo "npm not found on PATH." > "$STATE/web-ext-install.log"
@@ -280,7 +284,9 @@ fi
 if [ -z "$WEB_EXT" ]; then
   echo
   echo "Could not install web-ext. Last lines of $STATE/web-ext-install.log:" >&2
-  tail -12 "$STATE/web-ext-install.log" 2>/dev/null >&2 || true
+  # Order matters: point stdout at the real stderr BEFORE silencing fd 2,
+  # or the log lines go to /dev/null along with tail's own errors.
+  tail -12 "$STATE/web-ext-install.log" >&2 2>/dev/null || true
   cat >&2 <<'EOM'
 
 If npm reported 403, it is talking to registry.npmjs.org instead of your
