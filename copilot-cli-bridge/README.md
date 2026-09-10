@@ -59,7 +59,7 @@ than wandering if that one is taken.
 ```bash
 ./launch-firefox-bridge.sh --server    # just the server, foreground, for debugging
 ./launch-firefox-bridge.sh --restart   # restart the server, then Firefox
-./launch-firefox-bridge.sh --stop      # stop the server
+./launch-firefox-bridge.sh --stop      # stop the server (says what it actually stopped)
 ./launch-firefox-bridge.sh --manual    # server only + how to side-load the extension
 ```
 

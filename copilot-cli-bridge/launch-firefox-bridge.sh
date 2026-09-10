@@ -10,6 +10,7 @@
 #   ./launch-firefox-bridge.sh            start server (if needed) + Firefox
 #   ./launch-firefox-bridge.sh --server   just the server, in the foreground
 #   ./launch-firefox-bridge.sh --restart  restart the server, then Firefox
+#   ./launch-firefox-bridge.sh --stop     stop the server, and say what still holds the port
 #   ./launch-firefox-bridge.sh --manual   start the server and tell you how to
 #                                         load the extension by hand (no npm)
 #
@@ -72,10 +73,33 @@ ours_on() {
   ping_body "$1" | grep -q '"service":"copilot-cli-bridge"'
 }
 
+# Stops every bridge process regardless of which port it ended up on. Sets
+# STOPPED_COUNT so callers can report honestly instead of always claiming success.
+STOPPED_COUNT=0
 stop_server() {
-  pkill -f "bridge-server.js" 2>/dev/null || true
-  pkill -f "local-server.js" 2>/dev/null || true
+  local pids p
+  pids="$(pgrep -f 'bridge-server\.js|local-server\.js' 2>/dev/null || true)"
+  STOPPED_COUNT=0
+  [ -z "$pids" ] && return 0
+  STOPPED_COUNT="$(echo "$pids" | wc -w | tr -d ' ')"
+  kill $pids 2>/dev/null || true
   sleep 1
+  for p in $pids; do
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null || true
+  done
+}
+
+# Whatever still holds the port after that is somebody else's process.
+report_port_holder() {
+  local holder
+  holder="$(lsof -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | head -1 || true)"
+  [ -z "$holder" ] && return 0
+  echo
+  echo "Port $1 is still in use — by something that isn't this bridge:"
+  ps -o pid=,command= -p "$holder" 2>/dev/null | cut -c1-100 | sed 's/^/  /'
+  echo
+  echo "  Stop it with:   kill $holder"
+  echo "  Or ignore it:   the launcher walks to the next free port on its own."
 }
 
 # Settle on a port: adopt ours if it's already up, otherwise take the first
@@ -122,7 +146,12 @@ EOF
 case "${1:-}" in
   --stop)
     stop_server
-    echo "Bridge server stopped."
+    if [ "$STOPPED_COUNT" -gt 0 ]; then
+      echo "Stopped $STOPPED_COUNT bridge server process(es)."
+    else
+      echo "No bridge server was running."
+    fi
+    report_port_holder "$PORT"
     exit 0
     ;;
   --server)
