@@ -17,8 +17,11 @@ const path = require("path");
 const os = require("os");
 const C = require("./commands");
 
-const VERSION = "2.0.0";
-const PORT = Number(process.env.BRIDGE_PORT || 8765);
+const VERSION = "2.1.0";
+// 8765 is a popular default and collides with other tools on some machines.
+// launch-firefox-bridge.sh overrides this via BRIDGE_PORT and walks forward
+// until it finds a free one, then tells the extension which port it picked.
+const PORT = Number(process.env.BRIDGE_PORT || 18765);
 const LOG_PATH = path.join(os.homedir(), ".copilot-cli-bridge", "bridge.log");
 const MAX_BODY = 16 * 1024 * 1024;
 
@@ -122,6 +125,9 @@ const server = http.createServer(async (req, res) => {
     log("PING from " + (req.headers.origin || req.headers.referer || "unknown origin"));
     return json(res, 200, {
       ok: true,
+      // Distinctive marker: the launcher uses this to tell our bridge apart
+      // from any other service that happens to answer 200 on this port.
+      service: "copilot-cli-bridge",
       version: VERSION,
       cwd: C.state.cwd,
       platform: process.platform,
@@ -162,6 +168,16 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.on("clientError", (err, socket) => socket.destroy());
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    log(`port ${PORT} is already in use — set BRIDGE_PORT to a free port, or let ` +
+        `launch-firefox-bridge.sh pick one for you.`);
+    process.exit(2);
+  }
+  log("server error: " + err.message);
+  process.exit(1);
+});
 
 server.listen(PORT, "127.0.0.1", () => {
   log(`bridge server v${VERSION} on http://127.0.0.1:${PORT}`);

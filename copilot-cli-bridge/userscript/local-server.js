@@ -14,7 +14,7 @@ const os = require("os");
 const fs = require("fs");
 const path = require("path");
 
-const PORT = Number(process.env.BRIDGE_PORT || 8765);
+const PORT = Number(process.env.BRIDGE_PORT || 18765);
 const TOKEN =
   process.env.BRIDGE_TOKEN ||
   (() => {

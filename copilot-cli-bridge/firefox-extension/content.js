@@ -266,22 +266,28 @@
     return null;
   }
 
+  // Text of an element with anything this extension injected (Run buttons)
+  // stripped out, so our own UI never leaks into what we send or save.
+  function elementText(el, preferCode) {
+    if (!el) return "";
+    const src = (preferCode && el.querySelector("code")) || el;
+    if (!src.querySelector("[data-clibridge-ui]")) {
+      return (src.innerText || src.textContent || "").replace(/\s+$/, "");
+    }
+    const clone = src.cloneNode(true);
+    for (const n of clone.querySelectorAll("[data-clibridge-ui]")) n.remove();
+    return (clone.textContent || "").replace(/\s+$/, "");
+  }
+
   function capturePayload() {
     const el = lastReplyElement();
     if (!el) return { reply: "", blocks: [] };
-    const blocks = [...el.querySelectorAll("pre")].map((p) => {
-      const code = p.querySelector("code");
-      return (code || p).innerText.replace(/\s+$/, "");
-    });
+    const blocks = [...el.querySelectorAll("pre")].map((p) => elementText(p, true));
     // No <pre> inside the detected reply? Take the page's trailing code blocks.
     if (!blocks.length) {
-      const pres = [...document.querySelectorAll("pre")].slice(-5);
-      for (const p of pres) {
-        const code = p.querySelector("code");
-        blocks.push((code || p).innerText.replace(/\s+$/, ""));
-      }
+      for (const p of [...document.querySelectorAll("pre")].slice(-5)) blocks.push(elementText(p, true));
     }
-    return { reply: (el.innerText || "").replace(/\s+$/, ""), blocks };
+    return { reply: elementText(el), blocks };
   }
 
   // ---- panel -------------------------------------------------------------
@@ -328,10 +334,33 @@
     body.style.cssText =
       "margin:0;padding:10px 12px;overflow:auto;white-space:pre-wrap;word-break:break-word;flex:1 1 auto";
 
-    root.append(head, body);
+    // Footer holds contextual actions, e.g. "Send output to Copilot".
+    const foot = document.createElement("div");
+    foot.style.cssText =
+      "display:none;gap:6px;padding:8px 10px;background:#161a22;border-top:1px solid #2a2f3a;flex:0 0 auto";
+
+    root.append(head, body, foot);
     document.documentElement.appendChild(root);
-    panel = { root, body, cwd, dot, title };
+    panel = { root, body, cwd, dot, title, foot };
     return panel;
+  }
+
+  function setPanelActions(p, actions) {
+    p.foot.replaceChildren();
+    if (!actions || !actions.length) {
+      p.foot.style.display = "none";
+      return;
+    }
+    for (const a of actions) {
+      const b = document.createElement("button");
+      b.textContent = a.label;
+      b.style.cssText =
+        "background:#22303f;color:#cfe3ff;border:1px solid #33465c;border-radius:6px;" +
+        "padding:4px 10px;cursor:pointer;font:11px/1.5 ui-monospace,Menlo,monospace";
+      b.onclick = () => a.fn(b);
+      p.foot.appendChild(b);
+    }
+    p.foot.style.display = "flex";
   }
 
   function hidePanel() {
@@ -349,6 +378,7 @@
     p.dot.style.background = o.error ? "#ff7b72" : o.busy ? "#d29922" : "#7ee787";
     p.title.textContent = o.title || "CLI Bridge";
     if (o.cwd) p.cwd.textContent = o.cwd;
+    setPanelActions(p, o.actions);
     clearTimeout(p.root._timer);
     if (o.autoHide) p.root._timer = setTimeout(hidePanel, o.autoHide);
   }
@@ -414,7 +444,22 @@
       "code blocks:   " + payload.blocks.length + " in the last reply",
       "reply length:  " + payload.reply.length + " chars",
       "",
-      "If attachments fail, send me this output and I'll fix the selectors."
+      "Run buttons — decision per <pre> on the page:",
+      ...(document.querySelectorAll("pre").length
+        ? [...document.querySelectorAll("pre")].map((pre, i) => {
+            const t = elementText(pre, true);
+            const marks = [
+              "shell=" + looksLikeShell(t),
+              "inComposer=" + insideComposer(pre),
+              "state=" + (pre.dataset.clibridgeRun || "none"),
+              "button=" + !!pre.querySelector("[data-clibridge-ui]"),
+              "chars=" + t.length
+            ];
+            return "  [" + i + "] " + marks.join("  ") + "\n      " + JSON.stringify(t.slice(0, 60));
+          })
+        : ["  (no <pre> elements on the page)"]),
+      "",
+      "If something's off, send me this output and I'll fix the selectors."
     ].join("\n");
   }
 
@@ -598,13 +643,217 @@
     }
   }
 
+  // ---- Run button on shell code blocks ------------------------------------
+  //
+  // Copilot writes commands constantly; this puts a ▶ Run on the ones that are
+  // actually shell so you can execute them without retyping. Adding the button
+  // never runs anything — only your click does.
+
+  // Commands common enough to be worth recognising. Deliberately excludes
+  // ambiguous words like `export`, `import` and `open` that show up far more
+  // often in source code than in a terminal.
+  const SHELL_BINS =
+    /^(sudo|git|gh|glab|hg|svn|npm|npx|yarn|pnpm|bun|deno|node|python3?|pip3?|conda|poetry|uv|ruby|gem|bundle|rails|perl|lua|go|cargo|rustup|dotnet|java|javac|mvn|gradle|sbt|scala|make|cmake|docker|docker-compose|podman|kubectl|helm|terraform|aws|gcloud|az|brew|port|apt|apt-get|yum|dnf|pacman|snap|systemctl|launchctl|service|ssh|scp|rsync|curl|wget|nc|tar|zip|unzip|gzip|chmod|chown|mkdir|rmdir|rm|cp|mv|ln|touch|cat|head|tail|less|more|grep|rg|ag|find|fd|sed|awk|sort|uniq|wc|xargs|tee|diff|patch|echo|printf|cd|ls|pwd|du|df|tree|stat|file|which|whoami|env|date|sleep|watch|man|history|ps|top|htop|kill|killall|lsof|netstat|ifconfig|ping|dig|host|nslookup|traceroute|sysctl|mount|umount|diskutil|sw_vers|uname|pbcopy|pbpaste|osascript|plutil|codesign|hdiutil|installer|softwareupdate|defaults|caffeinate|openssl|base64|shasum|md5|jq|yq|sqlite3|psql|mysql|redis-cli|tmux|screen|crontab|pytest|jest|vitest|eslint|prettier|tsc|webpack|vite|ng|php|composer|swift|xcodebuild|pod|flutter|adb)(\s|$)/;
+
+  // Strong signals the block is source code, not a terminal session.
+  const CODE_VETO =
+    /(^|\n)\s*(function\s|class\s|interface\s|import\s+[\w{*]|from\s+['"]|def\s+\w+\s*\(|public\s+(static|class|void)|private\s+\w|package\s+\w|#include|<\?php|<[a-z]+[\s>])|=>\s*[{(]/;
+
+  function stripPrompt(line) {
+    return line.replace(/^\s*(?:[$>#]|PS\s*[^>]*>|\w[\w.-]*@[\w.-]+[:~][^$#]*[$#])\s+/, "").trim();
+  }
+
+  // A named binary is the strongest signal, but no list covers every tool. So
+  // also accept "bare lowercase word + real flag / pipe / redirect", which is
+  // what a command looks like regardless of which binary it names.
+  function commandish(line) {
+    const l = stripPrompt(line);
+    if (!l) return false;
+    if (SHELL_BINS.test(l)) return true;
+    // `export`/`source` are too common in JS to list as binaries, but these
+    // exact shapes are unambiguous: `export FOO=bar`, `source ~/.zshrc`.
+    if (/^(export|unset|alias)\s+[\w.]+=/.test(l)) return true;
+    if (/^(source|\.)\s+[~./]/.test(l)) return true;
+    // `x = a || b` is an assignment, not a command: shell assignment never has
+    // spaces around the `=`.
+    if (/^[\w.$-]+\s*=\s/.test(l)) return false;
+    const first = l.split(/\s+/)[0];
+    const plainWord = /^[a-z][\w.-]*$/.test(first);
+    const pathLike = /^\.{0,2}\/[\w./-]+$/.test(first);
+    if (!plainWord && !pathLike) return false;
+    // `-1` in `return -1` must not count, so a flag has to start with a letter.
+    return /\s-{1,2}[a-zA-Z]|\||&&|\s>>?\s|2>&1|\$\(|`/.test(l);
+  }
+
+  function looksLikeShell(text) {
+    if (!text || text.length > 20000) return false;
+    if (CODE_VETO.test(text)) return false;
+    const lines = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#") && !l.startsWith("//"));
+    if (!lines.length) return false;
+    // An explicit prompt marker is conclusive on its own.
+    if (lines.some((l) => /^[$>]\s+\S/.test(l))) return true;
+    let hits = 0;
+    for (const l of lines) if (commandish(l)) hits++;
+    return hits > 0 && hits / lines.length >= 0.6;
+  }
+
+  // Things worth a second look before running. Not a security boundary — the
+  // bridge runs whatever you approve — just a speed bump on the obvious ones.
+  const RISKY =
+    /(\brm\s+-[a-zA-Z]*[rf]|\bsudo\b|\bmkfs\b|\bdd\s+if=|>\s*\/dev\/[sh]d|\bchmod\s+-?R?\s*777|\|\s*(ba)?sh\b|\bgit\s+(push|clean)\b[^\n]*(-f|--force)|\bgit\s+reset\s+--hard|\bdrop\s+(table|database)\b|\bshutdown\b|\breboot\b|:\(\)\s*\{)/i;
+
+  const RUN_BG = "#1f6f3f";
+
+  function insideComposer(el) {
+    const composer = findComposer();
+    if (composer && (composer === el || composer.contains(el))) return true;
+    // A contenteditable composer can contain a <pre>; a <textarea> cannot.
+    return !!el.closest("[contenteditable='true']");
+  }
+
+  function addRunButton(pre) {
+    if (getComputedStyle(pre).position === "static") pre.style.position = "relative";
+    const btn = document.createElement("button");
+    btn.setAttribute("data-clibridge-ui", "1");
+    btn.textContent = "▶ Run";
+    btn.title = "Run this on your machine via the CLI bridge";
+    btn.style.cssText =
+      "position:absolute;top:6px;right:6px;z-index:20;background:" + RUN_BG + ";color:#eafff1;" +
+      "border:1px solid #2e8b57;border-radius:6px;padding:2px 8px;cursor:pointer;opacity:.85;" +
+      "font:11px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace";
+    btn.onmouseenter = () => (btn.style.opacity = "1");
+    btn.onmouseleave = () => (btn.style.opacity = ".85");
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      onRunClick(btn, pre);
+    });
+    pre.appendChild(btn);
+  }
+
+  function disarm(btn) {
+    btn.dataset.armed = "";
+    btn.textContent = "▶ Run";
+    btn.style.background = RUN_BG;
+    btn.style.borderColor = "#2e8b57";
+  }
+
+  async function onRunClick(btn, pre) {
+    const command = elementText(pre, true).trim();
+    if (!command) return;
+
+    if (RISKY.test(command) && btn.dataset.armed !== "1") {
+      btn.dataset.armed = "1";
+      btn.textContent = "⚠ Run anyway?";
+      btn.style.background = "#8a1f2b";
+      btn.style.borderColor = "#c23b4b";
+      showPanel(
+        "This command looks destructive:\n\n" + command +
+          "\n\nClick the button again within 6 seconds to run it.",
+        { error: true }
+      );
+      clearTimeout(btn._armTimer);
+      btn._armTimer = setTimeout(() => disarm(btn), 6000);
+      return;
+    }
+
+    clearTimeout(btn._armTimer);
+    disarm(btn);
+    btn.disabled = true;
+    btn.textContent = "running…";
+    showPanel("$ " + command + "\n\nworking…", { busy: true });
+
+    // /run takes the command verbatim — no parsing, so multi-line blocks and
+    // any quoting Copilot wrote survive intact.
+    const r = (await send({ type: "run", command })) || {};
+    btn.disabled = false;
+    btn.textContent = "▶ Run";
+
+    if (!r.ok) {
+      showPanel("$ " + command + "\n\n⛔ " + (r.error || "failed"), { error: true });
+      return;
+    }
+
+    const out = (r.stdout || "").replace(/\s+$/, "");
+    const err = (r.stderr || "").replace(/\s+$/, "");
+    let body = out + (err ? (out ? "\n" : "") + "[stderr]\n" + err : "");
+    if (!body) body = "(no output)";
+    if (r.killed) body += "\n[timed out]";
+
+    btn.textContent = r.code === 0 ? "▶ Run ✓" : "▶ Run ✗";
+    setTimeout(() => {
+      if (!btn.disabled) btn.textContent = "▶ Run";
+    }, 4000);
+
+    showPanel("$ " + command + "\n(exit " + r.code + ")\n\n" + body, {
+      error: r.code !== 0,
+      actions: [
+        {
+          label: "Send output to Copilot",
+          fn: (b) => {
+            appendToComposer(
+              "I ran this on my machine (exit " + r.code + "):\n\n```\n" + command +
+                "\n```\n\nOutput:\n\n```\n" + body + "\n```"
+            );
+            b.textContent = "✓ in the chat box";
+          }
+        },
+        { label: "Dismiss", fn: hidePanel }
+      ]
+    });
+  }
+
+  function decorateCodeBlocks(root) {
+    const scope = root && root.querySelectorAll ? root : document;
+    const pres = scope.querySelectorAll ? [...scope.querySelectorAll("pre")] : [];
+    if (scope.tagName === "PRE") pres.push(scope);
+    for (const pre of pres) {
+      if (pre.dataset.clibridgeRun === "1") continue;
+      if (insideComposer(pre)) continue;
+      const text = elementText(pre, true);
+      // Blocks still streaming in can start out not looking like shell, so a
+      // "skip" verdict is revisited whenever the text grows.
+      if (!looksLikeShell(text)) {
+        pre.dataset.clibridgeRun = "skip:" + text.length;
+        continue;
+      }
+      pre.dataset.clibridgeRun = "1";
+      addRunButton(pre);
+    }
+  }
+
+  let decorateTimer = null;
+  function scheduleDecorate() {
+    if (decorateTimer) return;
+    decorateTimer = setTimeout(() => {
+      decorateTimer = null;
+      try {
+        decorateCodeBlocks(document);
+      } catch (_) {}
+    }, 400);
+  }
+
   new MutationObserver((muts) => {
-    if (!autoRun) return;
+    let sawNodes = false;
     for (const m of muts) {
+      if (m.type === "characterData" || m.addedNodes.length) sawNodes = true;
+      if (!autoRun) continue;
       for (const n of m.addedNodes) if (n.nodeType === 1) scan(n);
       if (m.type === "characterData" && m.target.parentElement) scan(m.target.parentElement);
     }
+    if (sawNodes) scheduleDecorate();
   }).observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+
+  // Browsers throttle timers hard in a hidden tab, so a reply that streamed in
+  // while you were elsewhere can arrive undecorated. Catch up on return.
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) scheduleDecorate();
+  });
+
+  scheduleDecorate();
 
   // ---- greeting ----------------------------------------------------------
 

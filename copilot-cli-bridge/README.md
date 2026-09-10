@@ -47,8 +47,14 @@ cd ~/Projects/pinyridgelabs/scripts/copilot-cli-bridge
 ```
 
 That one command generates a token if you don't have one, starts the bridge
-server on `127.0.0.1:8765`, and launches Firefox with the extension loaded on a
+server on `127.0.0.1:18765`, and launches Firefox with the extension loaded on a
 persistent profile (your Copilot sign-in is remembered). Requires Node.js.
+
+If something else already holds that port, the launcher walks forward to the
+first free one and writes the port it settled on into the extension's generated
+config — so a machine with a conflict needs nothing edited. `BRIDGE_PORT=9999
+./launch-firefox-bridge.sh` pins a specific port instead, and fails loudly rather
+than wandering if that one is taken.
 
 ```bash
 ./launch-firefox-bridge.sh --server    # just the server, foreground, for debugging
@@ -113,6 +119,14 @@ When the Copilot page loads you'll see a panel confirming the connection. Type
 | `--max N` | Cap how many files are touched. |
 | `--all` | Include `node_modules`, `.git`, build output. |
 
+**Run buttons.** Any code block Copilot writes that is actually shell gets a
+**▶ Run** button in its corner. Click it and the command runs on your machine —
+multi-line blocks run as written — with the output in the panel and a one-click
+*Send output to Copilot*. Blocks that are source code don't get a button, and
+destructive-looking commands (`rm -rf`, `sudo`, `git push --force`, `curl | sh`)
+turn the button into **⚠ Run anyway?** and need a second click. Adding a button
+never runs anything; only your click does.
+
 Other niceties: **↑/↓** recalls previous `!` commands, **Esc** closes the panel,
 the chat box turns pink while you're in `!` mode.
 
@@ -135,9 +149,10 @@ can drive it:
 - The server binds to `127.0.0.1` only and requires a shared token on every
   request. The token lives in `.bridge-token` (git-ignored) and is baked into the
   extension at launch as `firefox-extension/token.js` (also git-ignored).
-- The content script only acts on a line **you type** starting with `!`. Page
-  content can't trigger a command — unless you turn `!auto on`, which re-enables
-  the `#!run` scanner. Don't, unless you're deliberately driving it that way.
+- The content script only acts on a line **you type** starting with `!`, or on a
+  **▶ Run** button you click. Page content can never execute on its own — unless
+  you turn `!auto on`, which re-enables the `#!run` scanner. Don't, unless you're
+  deliberately driving it that way.
 - `!save` writes files. It only ever writes where you point it.
 - Activity is logged to `~/.copilot-cli-bridge/bridge.log`, including a `PING`
   line each time the content script connects — useful for confirming it's alive.
@@ -159,14 +174,14 @@ If the panel says it can't reach the bridge, the server isn't running:
 
 ```
 server/
-  bridge-server.js   HTTP server on 127.0.0.1:8765, token auth, /cmd + /run + /ping
+  bridge-server.js   HTTP server on 127.0.0.1:18765, token auth, /cmd + /run + /ping
   commands.js        every ! command; all parsing and file work lives here
   fsutil.js          path resolution, globbing, walking, filters, formatting
 firefox-extension/
   manifest.json      MV2
   background.js      the only part allowed to reach the local server
   content.js         ! command line, panel, composer insertion, file attachment
-  token.js           generated at launch; git-ignored
+  bridge-config.js   token + chosen port, generated at launch; git-ignored
 launch-firefox-bridge.sh
 ```
 
@@ -175,7 +190,7 @@ Because every command is resolved server-side, you can test one without a browse
 ```bash
 curl -s -X POST -H "X-Bridge-Token: $(cat .bridge-token)" \
      -H 'Content-Type: application/json' \
-     -d '{"line":"ls server js"}' http://127.0.0.1:8765/cmd
+     -d '{"line":"ls server js"}' http://127.0.0.1:18765/cmd
 ```
 
 ## Legacy paths (not in use)

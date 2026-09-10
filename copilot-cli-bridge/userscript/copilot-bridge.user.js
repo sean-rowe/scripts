@@ -21,7 +21,7 @@
   // Paste the contents of .bridge-token here after installing the script. It is
   // left blank on purpose: this file is committed, and a token in it would be a
   // published secret.
-  const SERVER = "http://127.0.0.1:8765/run";
+  const SERVER = "http://127.0.0.1:18765/run";
   const TOKEN = "";
   const MARKER = "#!run";
   const AUTOTYPE = true;   // type the result back into the chat box

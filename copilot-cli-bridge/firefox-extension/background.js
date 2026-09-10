@@ -2,13 +2,18 @@
 // bridge server. Content scripts can't — the Copilot page's CSP blocks
 // connections to 127.0.0.1 from the content-script context.
 //
-// The token comes from token.js, which launch-firefox-bridge.sh generates from
-// .bridge-token. It is deliberately never hard-coded here — this file is
-// committed, and a token in it would be a published secret.
+// The token and port come from bridge-config.js, which
+// launch-firefox-bridge.sh generates each time it starts the server — the port
+// is whichever one it actually managed to bind, so a busy port on one machine
+// doesn't need anything edited here.
+//
+// The token is deliberately never hard-coded: this file is committed, and a
+// token in it would be a published secret.
 
 const api = typeof browser !== "undefined" ? browser : chrome;
-const BASE = "http://127.0.0.1:8765";
 const TOKEN = (typeof BRIDGE_TOKEN !== "undefined" && BRIDGE_TOKEN) || "";
+const PORT = (typeof BRIDGE_PORT !== "undefined" && BRIDGE_PORT) || 18765;
+const BASE = "http://127.0.0.1:" + PORT;
 
 // !claude can run for minutes; !shot waits on a drag-select. Be generous.
 const TIMEOUTS = { ping: 5000, cmd: 630000, run: 130000 };
@@ -18,7 +23,7 @@ async function call(pathname, body, timeoutMs) {
     return {
       ok: false,
       kind: "none",
-      error: "no bridge token — token.js wasn't generated. Run ./launch-firefox-bridge.sh"
+      error: "no bridge token — bridge-config.js wasn't generated. Run ./launch-firefox-bridge.sh"
     };
   }
   const controller = new AbortController();
@@ -40,7 +45,9 @@ async function call(pathname, body, timeoutMs) {
     return {
       ok: false,
       kind: "none",
-      error: "can't reach the bridge server on 127.0.0.1:8765 — start it with ./launch-firefox-bridge.sh"
+      error:
+        "can't reach the bridge server on 127.0.0.1:" + PORT +
+        " — start it with ./launch-firefox-bridge.sh"
     };
   } finally {
     clearTimeout(timer);
