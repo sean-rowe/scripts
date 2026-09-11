@@ -25,7 +25,7 @@
 # Usage:
 #   copilot-pack.py --story US847435
 #   copilot-pack.py --story DE9911 --path ~/Projects/backend
-#   copilot-pack.py --path . --no-story            # just pack the code
+#   copilot-pack.py --path .                       # just pack the code
 #
 # Options:
 #   --story <id>        Rally FormattedID (US123456 / DE9911). Its
@@ -43,7 +43,8 @@
 #                       are, before adding to them.
 #   --manifest          Prepend a table of contents (off by default — it is
 #                       hundreds of filenames before the first line of code)
-#   --no-story          Don't touch Rally, just pack the code
+#   --no-story          Ignore --story and don't touch Rally at all.
+#                       Without --story nothing is fetched anyway.
 #   --no-clipboard      Print the prompt instead of copying it
 #   --stdout            Write the pack to stdout instead of a file
 
@@ -488,24 +489,12 @@ def main():
             die(f"Cannot write {out}: {e}")
         out_name = out.name
 
-    # The story is the point of the exercise, so ask for it rather than
-    # quietly producing a pack with no story in it.
-    sid = args.story
-    if not sid and not args.no_story:
-        if sys.stdin.isatty():
-            while True:
-                sid = input("Rally story or defect id (e.g. US847435, "
-                            "or Enter to skip): ").strip()
-                if not sid:
-                    break
-                if STORY_ID_RE.fullmatch(sid.upper()):
-                    sid = sid.upper()
-                    break
-                print("  That does not look like a Rally id — expected two "
-                      "letters then digits, e.g. US847435 or DE9911.")
-        else:
-            warn("No --story given and not a terminal, so no story was "
-                 "fetched. Pass --story <id>, or --no-story to silence this.")
+    # No story is a perfectly good way to run this: the pack above is already
+    # written, and the story only ever adds context to the prompt below.
+    sid = args.story.strip().upper() if args.story else None
+    if sid and not STORY_ID_RE.fullmatch(sid):
+        warn(f"{sid} does not look like a Rally id — expected two letters "
+             f"then digits, e.g. US847435 or DE9911 — trying it anyway")
 
     story = None
     if sid and not args.no_story:
