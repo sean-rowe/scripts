@@ -37,6 +37,16 @@
 #   --max-total-mb <n>  Stop packing past this much code (default 8)
 #   --ext <list>        Extra comma-separated extensions to include
 #   --exclude <glob>    Skip paths matching this glob (repeatable)
+#   --only <glob>       Pack *only* paths matching this glob (repeatable).
+#                       The fastest way to cut a big pack down: --only
+#                       'src/main/java/*' beats a dozen --excludes.
+#   --squeeze           Strip trailing whitespace and collapse runs of blank
+#                       lines. Lossless, but near-useless on an already
+#                       formatted tree — the real size levers are --only,
+#                       --exclude, --no-tests and --max-file-kb.
+#   -v, --verbose       Log every file as it is packed
+#   --list              Print the packed file list and a size breakdown
+#   --show-skipped      Print every skipped file, grouped by why
 #   --no-tests          Leave test files out. They are included by default:
 #                       to fix a defect you need to see what is already
 #                       asserted, and what the project's test conventions
@@ -55,6 +65,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -211,8 +222,9 @@ def collect(root, args):
         rels = walk_files(root)
         mode = "directory walk (not a git repo)"
 
-    kept, skipped = [], {"ext": 0, "test": 0, "deny": 0, "big": 0,
-                         "binary": 0, "excluded": 0, "missing": 0}
+    # Skipped files are remembered, not just counted: "1,158 files" tells you
+    # nothing about what to exclude next, and a list does.
+    kept, skipped = [], defaultdict(list)
     extra = {e if e.startswith(".") else "." + e
              for e in (args.ext.split(",") if args.ext else []) if e.strip()}
     allow = SOURCE_EXT | extra
@@ -222,40 +234,59 @@ def collect(root, args):
         p = root / rel
         parts = Path(rel).parts
         if any(part in DENY_DIRS for part in parts):
-            skipped["deny"] += 1
+            skipped["vendor dir"].append(rel)
             continue
         name = Path(rel).name
         if any(fnmatch.fnmatch(name, g) for g in DENY_FILE_GLOBS):
-            skipped["deny"] += 1
+            skipped["generated/binary name"].append(rel)
             continue
         if args.exclude and any(fnmatch.fnmatch(rel, g) for g in args.exclude):
-            skipped["excluded"] += 1
+            skipped["--exclude"].append(rel)
+            continue
+        if args.only and not any(fnmatch.fnmatch(rel, g) or
+                                 fnmatch.fnmatch(name, g) for g in args.only):
+            skipped["--only"].append(rel)
             continue
         if p.suffix.lower() not in allow:
-            skipped["ext"] += 1
+            skipped["extension"].append(rel)
             continue
         if args.no_tests and is_test(rel):
-            skipped["test"] += 1
+            skipped["test"].append(rel)
             continue
         if not p.is_file():
-            skipped["missing"] += 1
+            skipped["missing"].append(rel)
             continue
         try:
             size = p.stat().st_size
         except OSError:
-            skipped["missing"] += 1
+            skipped["missing"].append(rel)
             continue
         if size > max_file:
-            skipped["big"] += 1
+            skipped["over --max-file-kb"].append(rel)
             continue
         if looks_binary(p):
-            skipped["binary"] += 1
+            skipped["binary content"].append(rel)
             continue
         kept.append((rel, size))
     return kept, skipped, mode
 
 
-def build_pack(root, kept, budget):
+def squeeze(text):
+    """Trailing whitespace off, runs of blank lines down to one.
+
+    Worth almost nothing on a formatted codebase — measured at 0.03% on
+    this repo — so it is off by default. It earns its keep on generated or
+    hand-mangled trees with double-spaced lines and trailing tabs."""
+    out, blanks = [], 0
+    for line in text.splitlines():
+        line = line.rstrip()
+        blanks = blanks + 1 if not line else 0
+        if blanks < 2:
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
+def build_pack(root, kept, budget, args):
     """Concatenate, newest-shallowest first so the most navigable files land
     before the budget runs out."""
     chunks, packed, used, dropped = [], [], 0, []
@@ -266,6 +297,9 @@ def build_pack(root, kept, budget):
         except OSError as e:
             warn(f"unreadable, skipping: {rel} ({e})")
             continue
+        if args.squeeze:
+            text = squeeze(text)
+            size = len(text.encode("utf-8"))
         lines = text.count("\n") + 1
         head = (f"{'=' * 78}\nFILE: {rel}\nLINES: {lines}  SIZE: {size / 1024:.1f} KB\n"
                 f"{'=' * 78}\n")
@@ -276,7 +310,21 @@ def build_pack(root, kept, budget):
         chunks.append(block)
         packed.append((rel, lines, size))
         used += len(block)
+        if args.verbose:
+            print(f"    + {rel}  ({lines} lines, {size / 1024:.1f} KB)")
     return chunks, packed, dropped
+
+
+def breakdown(packed):
+    """Where the bulk actually is, by extension — the table that tells you
+    which --exclude or --only is worth typing."""
+    by_ext = defaultdict(lambda: [0, 0, 0])      # files, lines, bytes
+    for rel, lines, size in packed:
+        row = by_ext[Path(rel).suffix.lower() or "(none)"]
+        row[0] += 1
+        row[1] += lines
+        row[2] += size
+    return sorted(by_ext.items(), key=lambda kv: -kv[1][2])
 
 
 # --------------------------------------------------------------------------
@@ -431,6 +479,11 @@ def main():
     ap.add_argument("--max-total-mb", type=float, default=8.0)
     ap.add_argument("--ext")
     ap.add_argument("--exclude", action="append", default=[])
+    ap.add_argument("--only", action="append", default=[])
+    ap.add_argument("--squeeze", action="store_true")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--show-skipped", action="store_true")
+    ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-tests", action="store_true")
     ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--no-story", action="store_true")
@@ -458,7 +511,9 @@ def main():
         die("No source files found. Check --path, or widen --ext.")
 
     budget = int(args.max_total_mb * 1024 * 1024)
-    chunks, packed, dropped = build_pack(root, kept, budget)
+    if args.verbose:
+        info(f"Packing {len(kept)} file(s)...")
+    chunks, packed, dropped = build_pack(root, kept, budget, args)
 
     # No table of contents by default: on a real repo it is hundreds of lines
     # of filenames before the first line of code, it repeats what the per-file
@@ -531,18 +586,58 @@ def main():
     print(f" Files:     {len(packed)} packed, {sum(l for _r, l, _s in packed):,} lines "
           f"({total_kb / 1024:.1f} MB)")
     print(f" Source:    {mode}")
-    excl = ", ".join(f"{v} {k}" for k, v in skipped.items() if v)
+    excl = ", ".join(f"{len(v)} {k}"
+                     for k, v in sorted(skipped.items(), key=lambda kv: -len(kv[1]))
+                     if v)
     if excl:
         print(f" Excluded:  {excl}")
     if dropped:
-        print(f" Over budget: {len(dropped)} file(s) left out "
-              f"(raise --max-total-mb to include them)")
+        skipped["over --max-total-mb"] = dropped
+        by_ext = defaultdict(int)
+        for rel in dropped:
+            by_ext[Path(rel).suffix.lower() or "(none)"] += 1
+        worst = ", ".join(f"{n} {e}" for e, n in
+                          sorted(by_ext.items(), key=lambda kv: -kv[1])[:6])
+        print(f" OVER BUDGET: {len(dropped)} file(s) did NOT make it in "
+              f"— {worst}")
+        print(f"              raise --max-total-mb (now {args.max_total_mb}), "
+              f"or narrow with --only/--exclude/--no-tests")
     print(f" Written:   {out}")
     if story:
         print(f" Story:     {story['sid']} — {story['name']}")
     else:
         print(" Story:     none — the prompt has no story context in it")
     print("=" * 62)
+
+    if packed and (args.list or args.verbose or len(packed) > 200):
+        print(" By extension:")
+        for ext, (n, lines, size) in breakdown(packed):
+            print(f"   {ext:<10} {n:>5} files  {lines:>8,} lines  "
+                  f"{size / 1024:>8.1f} KB")
+        biggest = sorted(packed, key=lambda k: -k[2])[:10]
+        print(" Largest files:")
+        for rel, lines, size in biggest:
+            print(f"   {size / 1024:>8.1f} KB  {lines:>7,} lines  {rel}")
+        if not args.list and not args.verbose:
+            print(" (--list for the full file list, --show-skipped for what "
+                  "was left out)")
+        print("=" * 62)
+
+    if args.list and not args.verbose:
+        print(" Packed:")
+        for rel, lines, size in packed:
+            print(f"   {rel}  ({lines} lines, {size / 1024:.1f} KB)")
+        print("=" * 62)
+
+    if args.show_skipped:
+        for reason, rels in sorted(skipped.items(), key=lambda kv: -len(kv[1])):
+            if not rels:
+                continue
+            print(f" Skipped — {reason} ({len(rels)}):")
+            for rel in rels:
+                print(f"   {rel}")
+        print("=" * 62)
+
     if copied:
         print(" Prompt is on the clipboard. In Copilot: attach the file above,")
         print(" then paste with Cmd-V.")
