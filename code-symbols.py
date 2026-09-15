@@ -133,6 +133,27 @@ def _load_packer():
 cp = _load_packer()
 DENY_DIRS = cp.DENY_DIRS if cp else {"node_modules", ".git", "build", "dist",
                                      "target", ".venv", "__pycache__"}
+DENY_FILE_GLOBS = cp.DENY_FILE_GLOBS if cp else ["*.min.js", "*.bundle.js"]
+
+# A webpack bundle is named main.41f0cfa51dac21c8a4e7.js — no glob catches
+# that, but the content does: minified code is one enormous line.
+HASHED_NAME = re.compile(r"\.[0-9a-f]{8,}\.(js|css|mjs)$", re.I)
+MINIFIED_LINE = 2000
+
+
+def looks_minified(path):
+    if HASHED_NAME.search(path.name):
+        return True
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(200_000)
+    except OSError:
+        return True
+    if not head:
+        return False
+    lines = head.split(b"\n")
+    longest = max(len(l) for l in lines)
+    return longest > MINIFIED_LINE
 
 
 def project_root(start):
@@ -150,19 +171,30 @@ def source_files(root):
             out = []
             for rel in rels:
                 p = root / rel
-                if any(d in Path(rel).parts for d in DENY_DIRS):
+                if not keepable(root, Path(rel)):
                     continue
-                if p.suffix.lower() in LANGS and p.is_file():
-                    out.append(p)
+                out.append(p)
             return out
     out = []
     for p in root.rglob("*"):
-        if p.suffix.lower() not in LANGS or not p.is_file():
-            continue
-        if any(d in p.relative_to(root).parts for d in DENY_DIRS):
-            continue
-        out.append(p)
+        if keepable(root, p.relative_to(root)):
+            out.append(p)
     return out
+
+
+def keepable(root, rel):
+    """Source we would index: right extension, not vendored, not generated,
+    not a minified bundle."""
+    if rel.suffix.lower() not in LANGS:
+        return False
+    if any(d in rel.parts for d in DENY_DIRS):
+        return False
+    if any(fnmatch.fnmatch(rel.name, g) for g in DENY_FILE_GLOBS):
+        return False
+    p = root / rel
+    if not p.is_file():
+        return False
+    return not looks_minified(p)
 
 
 # --------------------------------------------------------------------------
@@ -244,7 +276,12 @@ def parse_symbols(path, src_bytes):
 
     seen_lines = set()
 
-    def walk(node, parent, in_function):
+    # An explicit stack, not recursion: a minified bundle or a long chain of
+    # nested ternaries is thousands of nodes deep, and Python gives up at a
+    # thousand frames.
+    stack = [(tree.root_node, None, False)]
+    while stack:
+        node, parent, in_function = stack.pop()
         is_decl = (node.type.endswith(DECL_SUFFIXES) or node.type in EXTRA_DECLS)
         here, body = parent, in_function
         if is_decl:
@@ -272,10 +309,11 @@ def parse_symbols(path, src_bytes):
             elif kind in FUNCTION_KINDS:
                 # Everything below here is implementation detail.
                 body = True
-        for child in node.children:
-            walk(child, here, body)
+        # Reversed so children are visited in source order.
+        for child in reversed(node.children):
+            stack.append((child, here, body))
 
-    walk(tree.root_node, None, False)
+    out.sort(key=lambda sym: sym["line"])
     return out
 
 
@@ -344,7 +382,12 @@ def build_index(root, use_cache=True, rebuild=False):
             src = p.read_bytes()
         except OSError:
             continue
-        fresh[rel] = {"mtime": mtime, "symbols": parse_symbols(p, src)}
+        try:
+            syms = parse_symbols(p, src)
+        except (RecursionError, ValueError, RuntimeError) as e:
+            warn(f"could not parse {rel}: {e}")
+            syms = []
+        fresh[rel] = {"mtime": mtime, "symbols": syms}
         parsed += 1
 
     if use_cache:
@@ -473,17 +516,15 @@ def cmd_refs(root, index, args):
         parser = parser_for(lang) if lang else None
         wanted = set()
         if parser is not None:
-            tree = parser.parse(src)
-
-            def walk(n):
+            stack = [parser.parse(src).root_node]
+            while stack:
+                n = stack.pop()
                 if n.child_count == 0 and n.type in (
                         "identifier", "type_identifier", "field_identifier",
                         "property_identifier", "shorthand_property_identifier"):
                     if src[n.start_byte:n.end_byte].decode("utf8", "replace") == name:
                         wanted.add(n.start_point[0] + 1)
-                for c in n.children:
-                    walk(c)
-            walk(tree.root_node)
+                stack.extend(n.children)
         else:
             wanted = {i for i, l in enumerate(lines, 1) if word.search(l)}
 
@@ -525,7 +566,18 @@ def cmd_find(root, index, args):
             hits.append((rel, s))
     if not hits:
         return f"No symbol matching {args.target!r}."
-    hits.sort(key=lambda h: (len(h[1]["name"]), h[0]))
+    # A class named exactly what you typed beats a local variable that
+    # merely contains it.
+    def rank(h):
+        rel, sym = h
+        # Kind first: searching for "*Component" you want the classes, not a
+        # local variable that happens to be spelled `component`.
+        kindly = 0 if sym["kind"] in CONTAINER_KINDS else (
+            1 if sym["kind"] in FUNCTION_KINDS else 2)
+        inexact = sym["name"].lower() != args.target.lower().strip("*")
+        return (kindly, inexact, len(sym["name"]), rel)
+
+    hits.sort(key=rank)
     out = [f"{len(hits)} symbol(s) matching {args.target!r}:"]
     for rel, s in hits[:args.max]:
         out.append(f"  {s['kind']:<11} {qualified(s):<45} {rel}:{s['line']}")

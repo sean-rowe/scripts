@@ -632,8 +632,23 @@ def main():
         print(f" OVER BUDGET: {len(dropped)} file(s) did NOT make it in "
               f"— {worst}")
         print(f"              raise --max-total-mb (now {args.max_total_mb}) if "
-              f"your upload allows it, or narrow the pack:")
-        print(f"              --only 'src/*'   --exclude '*.md'   --no-tests")
+              f"your upload allows it, or narrow the pack.")
+        # On a polyglot monorepo the useful advice is not "exclude markdown",
+        # it is "you wanted one of these subtrees". Size them and say so.
+        if len(dropped) > len(packed):
+            areas = defaultdict(lambda: [0, 0])
+            for rel, size in kept:
+                top = Path(rel).parts[0] if len(Path(rel).parts) > 1 else "."
+                areas[top][0] += 1
+                areas[top][1] += size
+            ranked = sorted(areas.items(), key=lambda kv: -kv[1][1])[:8]
+            print()
+            print(f" MOST OF THIS REPO DID NOT FIT ({len(dropped)} of "
+                  f"{len(dropped) + len(packed)} files). Pack one area instead:")
+            for top, (n, size) in ranked:
+                fits = "fits" if size <= budget else "still too big"
+                print(f"   --only '{top}/*'".ljust(38)
+                      + f"{n:>6} files  {size / 1048576:>6.1f} MB  ({fits})")
     print(f" Written:   {out}")
     if story:
         print(f" Story:     {story['sid']} — {story['name']}")
