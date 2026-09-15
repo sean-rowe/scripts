@@ -34,7 +34,12 @@
 #   --out <file>        Output file (default: <project>-code.txt beside you)
 #   --config <path>     pod-audit.toml, for the Rally credentials
 #   --max-file-kb <n>   Skip any single file bigger than this (default 200)
-#   --max-total-mb <n>  Stop packing past this much code (default 8)
+#   --max-total-mb <n>  Stop packing past this much code (default 8, which
+#                       is also the bridge's upload limit). When it binds,
+#                       prose and config are cut before code — but if your
+#                       source alone exceeds it, narrow with --no-tests or
+#                       --only rather than raising it past what the
+#                       destination will accept.
 #   --ext <list>        Extra comma-separated extensions to include
 #   --exclude <glob>    Skip paths matching this glob (repeatable)
 #   --only <glob>       Pack *only* paths matching this glob (repeatable).
@@ -113,6 +118,31 @@ DENY_FILE_GLOBS = [
     "*.png", "*.jpg", "*.jpeg", "*.gif", "*.svg", "*.ico", "*.pdf", "*.zip",
     "*.woff", "*.woff2", "*.ttf", "*.eot", "*.mp4", "*.mp3",
 ]
+
+# When the budget cannot hold everything, it should cut the least valuable
+# thing, not the deepest one. Code outranks specs, specs outrank config,
+# config outranks prose.
+TIERS = [
+    (1, {".java", ".kt", ".kts", ".scala", ".groovy", ".cs", ".fs", ".vb",
+         ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
+         ".py", ".rb", ".go", ".rs", ".php", ".pl", ".lua", ".dart",
+         ".swift", ".m", ".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hh",
+         ".sh", ".bash", ".zsh", ".ps1"}),
+    (2, {".sql", ".graphql", ".gql", ".proto", ".thrift", ".feature"}),
+    (3, {".html", ".htm", ".css", ".scss", ".sass", ".less"}),
+    (4, {".gradle", ".properties", ".toml", ".tf", ".tfvars", ".yaml",
+         ".yml", ".xml", ".json", ".ini", ".cfg", ".env.example"}),
+    (5, {".md"}),
+]
+
+
+def tier(rel):
+    ext = Path(rel).suffix.lower()
+    for rank, exts in TIERS:
+        if ext in exts:
+            return rank
+    return 4
+
 
 TEST_PATTERNS = [
     # Maven/Gradle put tests under src/test and src/it; the rest are the
@@ -290,7 +320,8 @@ def build_pack(root, kept, budget, args):
     """Concatenate, newest-shallowest first so the most navigable files land
     before the budget runs out."""
     chunks, packed, used, dropped = [], [], 0, []
-    for rel, size in sorted(kept, key=lambda k: (Path(k[0]).parts.__len__(), k[0])):
+    order = sorted(kept, key=lambda k: (tier(k[0]), len(Path(k[0]).parts), k[0]))
+    for rel, size in order:
         p = root / rel
         try:
             text = p.read_text(encoding="utf-8", errors="replace")
@@ -600,8 +631,9 @@ def main():
                           sorted(by_ext.items(), key=lambda kv: -kv[1])[:6])
         print(f" OVER BUDGET: {len(dropped)} file(s) did NOT make it in "
               f"— {worst}")
-        print(f"              raise --max-total-mb (now {args.max_total_mb}), "
-              f"or narrow with --only/--exclude/--no-tests")
+        print(f"              raise --max-total-mb (now {args.max_total_mb}) if "
+              f"your upload allows it, or narrow the pack:")
+        print(f"              --only 'src/*'   --exclude '*.md'   --no-tests")
     print(f" Written:   {out}")
     if story:
         print(f" Story:     {story['sid']} — {story['name']}")
