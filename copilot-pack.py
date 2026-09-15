@@ -97,7 +97,10 @@ SOURCE_EXT = {
 
 # Directories that are never your code, even if someone committed them.
 DENY_DIRS = {
-    "node_modules", "bower_components", "jspm_packages", "vendor", "packages",
+    # "packages" is deliberately not here: it is NuGet's restore directory in
+    # one ecosystem and the entire source tree in another, and guessing wrong
+    # deletes the project.
+    "node_modules", "bower_components", "jspm_packages", "vendor",
     "target", "build", "dist", "out", "bin", "obj", "output", "release",
     ".venv", "venv", "env", "virtualenv", "__pycache__", ".tox", ".mypy_cache",
     ".pytest_cache", ".ruff_cache", ".gradle", ".m2", ".nuget",
@@ -260,10 +263,17 @@ def collect(root, args):
     allow = SOURCE_EXT | extra
     max_file = args.max_file_kb * 1024
 
+    # In a git repo, .gitignore has already removed build output, so a file
+    # that is still tracked was committed on purpose — second-guessing that
+    # with a directory name list is how `packages/` in a JS monorepo, or
+    # `docs/packages/`, silently vanishes. The list is for the walk, where
+    # there is no .gitignore doing the work.
+    trust_git = mode.startswith("git")
+
     for rel in sorted(rels):
         p = root / rel
         parts = Path(rel).parts
-        if any(part in DENY_DIRS for part in parts):
+        if not trust_git and any(part in DENY_DIRS for part in parts):
             skipped["vendor dir"].append(rel)
             continue
         name = Path(rel).name
@@ -622,6 +632,21 @@ def main():
                      if v)
     if excl:
         print(f" Excluded:  {excl}")
+    byext = skipped.get("extension") or []
+    if byext:
+        counts = defaultdict(int)
+        for rel in byext:
+            counts[Path(rel).suffix.lower() or "(no extension)"] += 1
+        top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
+        print("            not on the extension allowlist: "
+              + ", ".join(f"{n} {e}" for e, n in top))
+        print("            add any of them with --ext, e.g. --ext "
+              + ",".join(e.lstrip('.') for e, _n in top[:3] if e.startswith(".")))
+    big = skipped.get("over --max-file-kb") or []
+    if big:
+        print(f"            over --max-file-kb ({args.max_file_kb} KB): "
+              + ", ".join(Path(r).name for r in big[:4])
+              + (f", +{len(big) - 4} more" if len(big) > 4 else ""))
     if dropped:
         skipped["over --max-total-mb"] = dropped
         by_ext = defaultdict(int)
