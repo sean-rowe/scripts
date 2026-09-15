@@ -13,14 +13,15 @@
 # it how to fix the thing the story is asking for.
 #
 # What counts as "local code":
-#   In a git repo the file list comes from `git ls-files` plus untracked
-#   files git would keep — so anything .gitignore excludes (node_modules,
-#   target/, dist/, .venv, packages/) is already gone, which is exactly the
-#   line you want. Outside a repo it falls back to a directory walk with the
-#   usual vendor directories denied. On top of that: a source-extension
-#   allowlist, lock/minified/generated files dropped, binaries sniffed out,
-#   and per-file plus total size caps so the pack stays inside a model's
-#   context window.
+#   Everything, minus a deny list. In a git repo the file list comes from
+#   `git ls-files` plus untracked files git would keep, so anything
+#   .gitignore excludes (node_modules, target/, dist/, .venv) is already
+#   gone; outside a repo a directory walk denies those names directly.
+#   Then: lock/minified/generated files dropped, binaries sniffed out by
+#   content, anything that looks like a credential withheld, and per-file
+#   plus total size caps. There is no extension allowlist — an unfamiliar
+#   text file is packed, not silently discarded. Add your own exclusions
+#   with --exclude, or restrict to a few extensions with --ext.
 #
 # Usage:
 #   copilot-pack.py --story US847435
@@ -40,7 +41,12 @@
 #                       source alone exceeds it, narrow with --no-tests or
 #                       --only rather than raising it past what the
 #                       destination will accept.
-#   --ext <list>        Extra comma-separated extensions to include
+#   --ext <list>        Restrict the pack to these extensions, e.g.
+#                       --ext ts,tsx. Everything textual is included by
+#                       default, so this narrows rather than widens.
+#   --include-secrets   Pack files that look like credentials (.env, *.pem,
+#                       id_rsa, .npmrc...). They are withheld by default and
+#                       listed in the summary.
 #   --exclude <glob>    Skip paths matching this glob (repeatable)
 #   --only <glob>       Pack *only* paths matching this glob (repeatable).
 #                       The fastest way to cut a big pack down: --only
@@ -78,24 +84,14 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # Rally FormattedIDs: two letters then digits (US123456, DE9911, TA/TS...).
 STORY_ID_RE = re.compile(r"[A-Z]{2}\d{3,}")
 
-SOURCE_EXT = {
-    # languages
-    ".java", ".kt", ".kts", ".scala", ".groovy",
-    ".cs", ".fs", ".vb",
-    ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".svelte",
-    ".py", ".rb", ".go", ".rs", ".php", ".pl", ".lua", ".dart", ".swift", ".m",
-    ".c", ".h", ".cc", ".cpp", ".hpp", ".cxx", ".hh",
-    ".sh", ".bash", ".zsh", ".ps1",
-    ".sql", ".graphql", ".gql", ".proto", ".thrift",
-    # markup / style that carries behaviour
-    ".html", ".htm", ".css", ".scss", ".sass", ".less",
-    # build & config that explains wiring
-    ".gradle", ".properties", ".toml", ".tf", ".tfvars",
-    ".yaml", ".yml", ".xml", ".json", ".ini", ".cfg", ".env.example",
-    ".feature", ".md",
-}
+# Extensions are no longer an allowlist — anything textual that survives the
+# deny rules goes in. This set only decides packing ORDER when the budget
+# binds (see TIERS), so an unknown extension is included, just later.
 
 # Directories that are never your code, even if someone committed them.
+# Deliberately unambiguous names only: "packages" is NuGet's restore
+# directory in one ecosystem and the whole source tree in another, so
+# guessing wrong there deletes the project.
 DENY_DIRS = {
     # "packages" is deliberately not here: it is NuGet's restore directory in
     # one ecosystem and the entire source tree in another, and guessing wrong
@@ -145,6 +141,34 @@ def tier(rel):
         if ext in exts:
             return rank
     return 4
+
+
+# Credentials. Taking everything by default means a tracked private key or
+# .env would otherwise be uploaded to a third party, which is a different
+# kind of mistake from packing a file you did not need. Overridable with
+# --include-secrets, and always reported rather than dropped quietly.
+SECRET_DIRS = {".ssh", ".aws", ".gnupg", ".gpg", ".kube", ".chef",
+               ".password-store", ".gcloud"}
+SECRET_GLOBS = [
+    ".env", ".env.*", "*.env",
+    "id_rsa*", "id_dsa*", "id_ecdsa*", "id_ed25519*", "*.ppk",
+    "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore", "*.kdbx",
+    ".netrc", "_netrc", ".npmrc", ".pypirc", ".dockercfg",
+    ".git-credentials", "credentials", "credentials.json",
+    "service-account*.json", "secrets.json", "secrets.yml", "secrets.yaml",
+]
+# An example file is the documentation of a secret, not the secret.
+SECRET_EXCEPTIONS = ["*.example", "*.sample", "*.template", "*.dist",
+                     "*example*", "*.md"]
+
+
+def is_secret(rel):
+    name = Path(rel).name
+    if any(part in SECRET_DIRS for part in Path(rel).parts):
+        return True
+    if any(fnmatch.fnmatch(name, g) for g in SECRET_EXCEPTIONS):
+        return False
+    return any(fnmatch.fnmatch(name, g) for g in SECRET_GLOBS)
 
 
 TEST_PATTERNS = [
@@ -258,23 +282,20 @@ def collect(root, args):
     # Skipped files are remembered, not just counted: "1,158 files" tells you
     # nothing about what to exclude next, and a list does.
     kept, skipped = [], defaultdict(list)
-    extra = {e if e.startswith(".") else "." + e
+    # --ext is now a restriction, not an addition: with no allowlist left to
+    # extend, "--ext ts,tsx" can only sensibly mean "only these".
+    allow = {e if e.startswith(".") else "." + e
              for e in (args.ext.split(",") if args.ext else []) if e.strip()}
-    allow = SOURCE_EXT | extra
     max_file = args.max_file_kb * 1024
-
-    # In a git repo, .gitignore has already removed build output, so a file
-    # that is still tracked was committed on purpose — second-guessing that
-    # with a directory name list is how `packages/` in a JS monorepo, or
-    # `docs/packages/`, silently vanishes. The list is for the walk, where
-    # there is no .gitignore doing the work.
-    trust_git = mode.startswith("git")
 
     for rel in sorted(rels):
         p = root / rel
         parts = Path(rel).parts
-        if not trust_git and any(part in DENY_DIRS for part in parts):
+        if any(part in DENY_DIRS for part in parts):
             skipped["vendor dir"].append(rel)
+            continue
+        if not args.include_secrets and is_secret(rel):
+            skipped["looks like a credential"].append(rel)
             continue
         name = Path(rel).name
         if any(fnmatch.fnmatch(name, g) for g in DENY_FILE_GLOBS):
@@ -287,8 +308,8 @@ def collect(root, args):
                                  fnmatch.fnmatch(name, g) for g in args.only):
             skipped["--only"].append(rel)
             continue
-        if p.suffix.lower() not in allow:
-            skipped["extension"].append(rel)
+        if allow and p.suffix.lower() not in allow:
+            skipped["--ext"].append(rel)
             continue
         if args.no_tests and is_test(rel):
             skipped["test"].append(rel)
@@ -526,6 +547,7 @@ def main():
     ap.add_argument("--show-skipped", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--no-tests", action="store_true")
+    ap.add_argument("--include-secrets", action="store_true")
     ap.add_argument("--manifest", action="store_true")
     ap.add_argument("--no-story", action="store_true")
     ap.add_argument("--no-clipboard", action="store_true")
@@ -632,16 +654,24 @@ def main():
                      if v)
     if excl:
         print(f" Excluded:  {excl}")
-    byext = skipped.get("extension") or []
+    secrets = skipped.get("looks like a credential") or []
+    if secrets:
+        print(f" WITHHELD:  {len(secrets)} file(s) that look like credentials "
+              f"— not packed:")
+        for rel in secrets[:6]:
+            print(f"              {rel}")
+        if len(secrets) > 6:
+            print(f"              +{len(secrets) - 6} more")
+        print("              --include-secrets if you really mean to send them")
+    byext = skipped.get("--ext") or []
     if byext:
         counts = defaultdict(int)
         for rel in byext:
             counts[Path(rel).suffix.lower() or "(no extension)"] += 1
         top = sorted(counts.items(), key=lambda kv: -kv[1])[:8]
-        print("            not on the extension allowlist: "
+        print("            outside --ext: "
               + ", ".join(f"{n} {e}" for e, n in top))
-        print("            add any of them with --ext, e.g. --ext "
-              + ",".join(e.lstrip('.') for e, _n in top[:3] if e.startswith(".")))
+        print("            widen or drop --ext to include them")
     big = skipped.get("over --max-file-kb") or []
     if big:
         print(f"            over --max-file-kb ({args.max_file_kb} KB): "
