@@ -1283,6 +1283,92 @@ define(["claude", "cc"], {
   });
 });
 
+// -- symbols ---------------------------------------------------------------
+//
+// The retrieval tier: ask for one class's shape, one method's body, or every
+// call site, instead of attaching whole files. Backed by code-symbols.py,
+// which parses with tree-sitter and caches per project, so these are fast
+// enough to use conversationally.
+
+const SYMBOLS_PY = path.join(__dirname, "..", "..", "code-symbols.py");
+
+async function symbols(sub, target, ctx) {
+  if (!fs.existsSync(SYMBOLS_PY)) {
+    return fail("code-symbols.py not found next to the bridge (expected at "
+      + U.tildify(SYMBOLS_PY) + ")");
+  }
+  const args = [SYMBOLS_PY, sub, target, "--root", state.cwd];
+  if (ctx.flags.max) args.push("--max", String(num(ctx.flags.max, 60)));
+  if (ctx.flags.kind) args.push("--kind", String(ctx.flags.kind));
+  if (ctx.flags.fresh) args.push("--no-cache");
+
+  const quoted = args.map((a) => JSON.stringify(a)).join(" ");
+  const r = await runShell("python3 " + quoted, { timeoutMs: 120000 });
+  const body = (r.stdout || "").replace(/\s+$/, "");
+  const err = (r.stderr || "").replace(/\s+$/, "");
+  if (!body) {
+    return fail(err || ("code-symbols.py " + sub + " produced no output"));
+  }
+  // A missing tree-sitter is a warning, not a failure: the fallback scanner
+  // still answered, and the user should know the answer is approximate.
+  const warned = /WARNING|fallback/.test(err) ? "\n\n_(" + err.split("\n")[0] + ")_" : "";
+  return textOrFile(body + warned, {
+    local: ctx.flags.q,
+    forceFile: ctx.flags.file,
+    inline: ctx.flags.inline,
+    fileName: sub + "-" + String(target).replace(/\W+/g, "_").slice(0, 40) + ".md"
+  });
+}
+
+define(["sym", "outline"], {
+  group: "context",
+  usage: "!sym <Class|file>",
+  help: "Outline a class or file: fields and every method signature, no bodies."
+}, async (ctx) => {
+  if (!ctx.rest) return fail("usage: !sym <Class|path/to/File.java>");
+  return symbols("outline", ctx.positional[0] || ctx.rest, ctx);
+});
+
+define(["body", "src"], {
+  group: "context",
+  usage: "!body <Class.method>",
+  help: "Paste just that method's source — the 20 lines, not the 800-line file."
+}, async (ctx) => {
+  if (!ctx.rest) return fail("usage: !body <Class.method>  (or just <method>)");
+  return symbols("body", ctx.positional[0] || ctx.rest, ctx);
+});
+
+define(["refs", "callers"], {
+  group: "context",
+  usage: "!refs <name>",
+  help: "Every reference to a name, with file:line and the method it sits in."
+}, async (ctx) => {
+  if (!ctx.rest) return fail("usage: !refs <name>");
+  return symbols("refs", ctx.positional[0] || ctx.rest, ctx);
+});
+
+define(["sfind", "symfind"], {
+  group: "context",
+  usage: "!sfind <pattern>",
+  help: "Fuzzy symbol search across the project: where is anything called X?"
+}, async (ctx) => {
+  if (!ctx.rest) return fail("usage: !sfind <pattern>");
+  return symbols("find", ctx.positional[0] || ctx.rest, ctx);
+});
+
+define(["sindex"], {
+  group: "context",
+  usage: "!sindex [--fresh]",
+  help: "Build or refresh the symbol index for the working directory."
+}, async (ctx) => {
+  const args = [SYMBOLS_PY, "index", "--root", state.cwd];
+  if (ctx.flags.fresh || ctx.flags.rebuild) args.push("--rebuild");
+  const r = await runShell("python3 " + args.map((a) => JSON.stringify(a)).join(" "),
+    { timeoutMs: 300000 });
+  const body = (r.stdout + (r.stderr ? "\n" + r.stderr : "")).replace(/\s+$/, "");
+  return note(body || "no output");
+});
+
 // -- dispatch --------------------------------------------------------------
 
 async function dispatch(line, opts) {

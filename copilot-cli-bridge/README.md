@@ -110,6 +110,30 @@ When the Copilot page loads you'll see a panel confirming the connection. Type
 | `!clip` | Paste your clipboard in. |
 | `!url <url>` | Fetch a page or localhost API and paste it as text. |
 
+**Ask about symbols, not files**
+
+Backed by `code-symbols.py` one directory up, which parses with tree-sitter
+and caches per project. The point is to stop attaching an 800-line file to
+ask about one method.
+
+| | |
+|---|---|
+| `!sym <Class\|file>` | Outline: fields and every method signature, no bodies. |
+| `!body <Class.method>` | Just that method's source. `!body transitionStatus` works too. |
+| `!refs <name>` | Every call site, with `file:line` and the method it sits in. |
+| `!sfind <pattern>` | Fuzzy symbol search: where is anything called X? |
+| `!sindex [--fresh]` | Build or refresh the index for the working directory. |
+
+A 2,300-file repo indexes in about six seconds and answers in under one
+after that. Without tree-sitter installed
+(`pip3 install --user tree-sitter tree-sitter-language-pack`) it falls back
+to a brace scanner: outlines stay good, references get approximate, and the
+reply says so.
+
+The workflow these are for: `!pack src --ext java` once for the map, then
+`!body` and `!refs` as the conversation goes, instead of re-attaching the
+project every time Copilot needs to see something.
+
 **Read and search locally**
 
 | | |
